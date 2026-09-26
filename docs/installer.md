@@ -1,0 +1,149 @@
+# ScreenVault — Windows Installer & Deployment Guide
+
+This document details the architecture, configuration, build pipeline, and silent IT deployment procedures for the **ScreenVault Windows Installer** (`ScreenVault_Setup_<version>.exe`), built using **Inno Setup 6.3+**.
+
+---
+
+## 1. Architectural Invariants & Security Principles
+
+| Invariant | Implementation Detail | Rationale |
+|---|---|---|
+| **App Privileges** | Application manifest configures `<requestedExecutionLevel level="asInvoker" uiAccess="false" />`. | The app **never** requires administrative privileges. Elevated applications pose security risks and fail to launch properly from Startup at user login. |
+| **Installer Execution** | Setup launches ScreenVault using `Flags: runasoriginaluser`. | Even when Setup runs elevated with admin rights, the application is spawned under the normal logged-in user's token. |
+| **Installation Scopes** | Dual-mode: **All Users** (machine-wide, `{autopf}\ScreenVault`) or **Only for me** (per-user, `%LocalAppData%\Programs\ScreenVault`). | Supports corporate deployments into Program Files as well as standard unprivileged user workstations without UAC prompts. |
+| **Storage Defaults Protocol** | Setup writes `{app}\install-defaults.json`. The app inspects and applies it on the user's first run. | Prevents writing user-specific registry keys (HKCU) or `%UserProfile%` folders from an elevated admin process (which might belong to an over-the-shoulder admin). |
+| **Autostart Ownership** | All-users: HKLM `Run` entry created by installer; app disables duplicate HKCU entry. Per-user: App manages HKCU `Run` entry. | Prevents duplicate launches at login. If an HKLM entry exists, the user setting toggle controls whether the app stays running upon `--autostart` invocation. |
+| **Graceful Upgrades** | `PrepareToInstall` stops running instances via `ScreenVault.exe --exit --wait`. | Video pipelines and segments are safely closed and flushed to disk before any files are overwritten. If recording, state is saved to `resume.json`. |
+| **Post-Upgrade Resumption** | Setup relaunches with `--minimize-to-tray --after-upgrade`. | If `resume.json` exists and is `< 15 min` old, recording automatically resumes in a new session with marker `"Resumed after upgrade"`. |
+| **Uninstaller Safety** | Uninstaller gracefully stops ScreenVault, removes binaries and Run entries. | **Recordings are NEVER deleted.** A final dialog explicitly displays the primary and backup recording locations. |
+
+---
+
+## 2. Shared Identifiers & GUIDs
+
+To ensure seamless single-instance management, graceful shutdown, and in-place upgrades:
+
+- **Setup `AppId`**:
+  `{{7C0A45B9-F2D7-4952-B79D-5B6608C42589}`
+  *(Never modify this GUID across releases; altering it breaks in-place upgrades and results in duplicate entries in Windows Installed Apps).*
+- **Single-Instance Mutex**:
+  `ScreenVault-7C0A45B9-F2D7-4952-B79D-5B6608C42589`
+  Defined centrally in [`AppConstants.AppMutexName`](file:///x:/Screen%20recording%20tool/src/ScreenVault.Core/Infrastructure/AppConstants.cs) and referenced in [`ScreenVault.iss`](file:///x:/Screen%20recording%20tool/installer/ScreenVault.iss) as `AppMutexName`.
+- **Setup Mutex**:
+  `ScreenVaultSetupMutex` (prevents multiple setup instances from running concurrently).
+
+---
+
+## 3. Setup Wizard Structure
+
+1. **Install Scope Dialog**: Prompts user for "Install for all users (recommended)" vs "Install for me only".
+2. **Welcome Page**: Explains ScreenVault's background meeting recording functionality and tray presence.
+3. **License Agreement**: Displays [`installer/assets/LICENSE.txt`](file:///x:/Screen%20recording%20tool/installer/assets/LICENSE.txt), incorporating the ScreenVault MIT license, FFmpeg GPL terms, and third-party notices.
+4. **Select Destination Directory**: Defaults to `{autopf}\ScreenVault` (`C:\Program Files\ScreenVault` in all-users, or `%LocalAppData%\Programs\ScreenVault` in per-user).
+5. **Recording Storage (Custom Page)**:
+   - **Primary Folder**: Defaults to `%USERPROFILE%\Videos\Screen Recordings`. If unchanged, `install-defaults.json` stores `null`, instructing the app to resolve `Environment.SpecialFolder.MyVideos` under the actual logged-in user profile.
+   - **Backup Folder**: Automatically detects the largest secondary fixed drive (e.g. `D:\ScreenVault Backup`) or remains empty if only one drive is present.
+   - **Dynamic Space Labels**: Static labels directly beneath each input box dynamically display real-time free space (e.g., `212 GB free on C:\`).
+   - **Validation**: Enforces non-empty primary folder, warns if primary and backup are on the same volume, warns if backup is omitted, warns on UNC network paths, and warns if available space is below 10 GB.
+6. **Select Tasks**:
+   - `desktopicon`: Create a desktop shortcut.
+   - `startwithwindows`: Start ScreenVault when user signs in (tray only, does not record).
+   - `startrecording`: Automatically begin recording as soon as ScreenVault launches.
+7. **Ready to Install**: Summarizes install directory, tasks, and chosen primary/backup storage paths via `UpdateReadyMemo`.
+8. **Installing**: Gracefully halts any running ScreenVault instance before copying published ReadyToRun files.
+9. **Finish**: Offers optional checkbox to launch ScreenVault immediately as standard user (`runasoriginaluser`).
+
+---
+
+## 4. `install-defaults.json` Protocol
+
+Located in `{app}\install-defaults.json`, written during installation (`CurStepChanged(ssPostInstall)`):
+
+```json
+{
+  "installScope": "AllUsers",
+  "installerVersion": "1.2.0",
+  "defaultsRevision": "2026-09-25T14:05:11",
+  "primaryLocation": null,
+  "backupLocation": "D:\\ScreenVault Backup",
+  "startWithWindows": true,
+  "startRecordingOnLaunch": false
+}
+```
+
+### Application Application Lifecycle
+1. On startup, [`InstallDefaultsService.TryApplyDefaults`](file:///x:/Screen%20recording%20tool/src/ScreenVault.Core/Settings/InstallDefaultsService.cs) reads `{app}\install-defaults.json`.
+2. If `defaultsRevision != settings.AppliedDefaultsRevision`:
+   - Storage locations are configured (resolving `null` to the user's localized Videos directory).
+   - Directories are created as the running user (ensuring proper DACLs and ownership).
+   - Startup settings (`StartWithWindows`, `StartRecordingOnLaunch`) are applied.
+   - `settings.AppliedDefaultsRevision` is saved.
+   - An informational balloon notification appears: *"Settings from the installer were applied."*
+
+---
+
+## 5. CLI Arguments & Exit Codes
+
+| Flag | Purpose | Behavior |
+|---|---|---|
+| `--autostart` | Invoked at Windows sign-in | If `settings.General.StartWithWindows` is disabled, the process exits immediately with code `0`. If enabled, respects `startupDelaySeconds` and begins recording if `startRecordingOnLaunch` is true. |
+| `--exit` | Stop running instance | If an instance is active, sends IPC exit command. If no instance is active, exits with code `2`. |
+| `--exit --wait` | Stop and wait for termination | Sends IPC exit command, polls mutex for up to 30 seconds until fully released. Exit codes: `0` (clean exit), `1` (timeout), `2` (not running). |
+| `--after-upgrade` | Post-upgrade relaunch | Inspects `%LocalAppData%\ScreenVault\resume.json`. If valid and `< 15 min` old, resumes recording with marker `"Resumed after upgrade"`, displays toast, and deletes `resume.json`. |
+| `--minimize-to-tray` | Silent tray launch | Starts ScreenVault minimized without showing the main Status window. |
+
+---
+
+## 6. Windows Restart Manager & Shutdown
+
+ScreenVault implements a dedicated native message listener ([`RestartManagerWindow`](file:///x:/Screen%20recording%20tool/src/ScreenVault.App/Platform/RestartManagerWindow.cs)):
+- `WM_QUERYENDSESSION`: When queried by Restart Manager (`lParam & ENDSESSION_CLOSEAPP != 0`) or OS shutdown, ScreenVault invokes `ShutdownBlockReasonCreate` to prevent premature process termination while closing files.
+- `WM_ENDSESSION`: Gracefully concludes recording, writes `%LocalAppData%\ScreenVault\resume.json` if recording was active, finishes segment muxing, releases the block reason via `ShutdownBlockReasonDestroy`, and exits cleanly.
+
+---
+
+## 7. Silent & IT Enterprise Deployment
+
+ScreenVault Setup supports full silent deployment via command line:
+
+```bat
+:: Enterprise All-Users Silent Installation (Machine-wide)
+ScreenVault_Setup_1.2.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ALLUSERS ^
+  /TASKS="startwithwindows" /PRIMARY="D:\Recordings" /BACKUP="E:\ScreenVault Backup" ^
+  /LOG="C:\Temp\screenvault-install.log"
+
+:: Per-User Silent Installation (No administrative elevation needed)
+ScreenVault_Setup_1.2.0.exe /VERYSILENT /CURRENTUSER
+
+:: Upgrade with Storage Reconfiguration
+ScreenVault_Setup_1.2.0.exe /RECONFIGURE
+
+:: Silent Uninstallation
+"C:\Program Files\ScreenVault\unins000.exe" /VERYSILENT /NORESTART
+```
+
+---
+
+## 8. Build Pipeline (`build/build.ps1`)
+
+Execute the unified build and package script:
+
+```powershell
+# Standard Release Build
+.\build\build.ps1
+
+# Specify Custom Version and Skip Unit Tests
+.\build\build.ps1 -Version 1.2.0 -SkipTests
+
+# Code Signing with PFX Certificate
+.\build\build.ps1 -Sign -CertPath "C:\Certs\CompanyCodeSign.pfx" -CertPassword "Secret123"
+```
+
+### Build Pipeline Steps
+1. Detects version from `-Version` or `Directory.Build.props`.
+2. Executes `dotnet test ScreenVault.sln -c Release` (halts on any failure).
+3. Publishes self-contained ReadyToRun folder publish to `artifacts/publish/` (win-x64).
+4. Bundles bundled FFmpeg utilities (`ffmpeg.exe`, `ffprobe.exe`, `ffplay.exe`), notices, and licenses.
+5. Verifies absence of temporary configuration or log files.
+6. Invokes Inno Setup compiler (`ISCC.exe`) targeting `installer/ScreenVault.iss`.
+7. Calculates SHA-256 hash and writes `artifacts/installer/ScreenVault_Setup_<version>.exe.sha256.txt`.

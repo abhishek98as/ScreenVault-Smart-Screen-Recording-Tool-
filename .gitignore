@@ -1,0 +1,35 @@
+## Visual Studio / .NET
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+TestResults/
+
+## Tools (FFmpeg binaries are too large for GitHub — download separately)
+tools/ffmpeg/ffmpeg.exe
+tools/ffmpeg/ffprobe.exe
+tools/ffmpeg/ffplay.exe
+tools/ffmpeg/*.exe
+
+## Local App Data / Logs / Outputs
+*.log
+*.partial
+*.ts
+*.mkv
+*.mp4
+
+## Build & Distribution
+publish/
+dist/
+artifacts/
+
+## Internal Development Prompt Files (not for public repo)
+ScreenVault_Development_Plan.md
+ScreenVault_Final_Fix_Prompt.md
+ScreenVault_Installer_Prompt.md
+ScreenVault_v1.1_BugFixes_and_Features.md
+firebase-debug.log
+screenrecorder/
