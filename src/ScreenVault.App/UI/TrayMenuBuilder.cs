@@ -23,7 +23,8 @@ public static class TrayMenuBuilder
         Action showStatusAction,
         Action showSettingsAction,
         Action showLibraryAction,
-        Action exitAction)
+        Action exitAction,
+        IWin32Window? owner = null)
     {
         ArgumentNullException.ThrowIfNull(controller);
         ArgumentNullException.ThrowIfNull(audioEngine);
@@ -68,7 +69,7 @@ public static class TrayMenuBuilder
             var stopItem = ModernMenu.Item("Stop && save", Glyphs.Stop, async (_, _) =>
             {
                 if (controller.State is RecorderState.Recording or RecorderState.Paused &&
-                    !RecordingPrompts.ConfirmStop(null, settingsService))
+                    !RecordingPrompts.ConfirmStop(owner, settingsService))
                 {
                     return;
                 }
@@ -111,7 +112,9 @@ public static class TrayMenuBuilder
         {
             var timeStr = health.Elapsed.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture);
             using var dlg = new MarkerNoteForm(timeStr);
-            if (dlg.ShowDialog() == DialogResult.OK)
+            // Owning it to the status flyout (when one is available) keeps it from opening behind
+            // that always-topmost window.
+            if (dlg.ShowDialog(owner) == DialogResult.OK)
             {
                 markerService.AddMarker(dlg.NoteText, "User");
             }
@@ -164,7 +167,7 @@ public static class TrayMenuBuilder
         menu.Items.Add(ModernMenu.Item("Exit ScreenVault", Glyphs.Close, (_, _) =>
         {
             if (controller.Desired != DesiredState.Stopped &&
-                !RecordingPrompts.ConfirmExitWhileRecording(null))
+                !RecordingPrompts.ConfirmExitWhileRecording(owner))
             {
                 return;
             }

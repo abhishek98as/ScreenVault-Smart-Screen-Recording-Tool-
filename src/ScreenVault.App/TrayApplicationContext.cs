@@ -221,7 +221,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                         return;
                     }
 
-                    var prompt = new MeetingEndedPromptForm(e.AppName, onStopRecording: () => { _ = _controller.StopAsync(); });
+                    var prompt = new MeetingEndedPromptForm(e.AppName, onStopRecording: () => { _ = _controller.StopAsync(); }) { Owner = _statusForm };
                     prompt.Show();
                 });
             }
@@ -240,7 +240,8 @@ public sealed class TrayApplicationContext : ApplicationContext
 
                 var prompt = new ReminderPromptForm(
                     onStartRecording: () => { _ = _controller.StartAsync(); },
-                    _reminderService);
+                    _reminderService)
+                { Owner = _statusForm };
                 prompt.Show();
             });
         };
@@ -375,7 +376,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         try
         {
             using var wizard = new FirstRunWizardForm(_settingsService, _audioEngine);
-            wizard.ShowDialog();
+            wizard.ShowDialog(_statusForm);
         }
         catch (Exception ex)
         {
@@ -436,7 +437,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             RunOnUi(() =>
             {
-                var dlg = new SavedDialog(manifest, _settingsService, _sessionStore, _playerLauncher, finalizeTask);
+                var dlg = new SavedDialog(manifest, _settingsService, _sessionStore, _playerLauncher, finalizeTask) { Owner = _statusForm };
                 dlg.Show();
             });
         }
@@ -500,7 +501,8 @@ public sealed class TrayApplicationContext : ApplicationContext
                         _recordingStartedForMeeting = e.AppKey;
                         _ = _controller.StartAsync();
                     },
-                    onAlwaysForApp: AlwaysRecordMeetingsFrom);
+                    onAlwaysForApp: AlwaysRecordMeetingsFrom)
+                { Owner = _statusForm };
                 prompt.Show();
             });
         }
@@ -579,7 +581,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             var elapsed = _controller.Health.Elapsed.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture);
             using var dlg = new MarkerNoteForm(elapsed);
-            if (dlg.ShowDialog() == DialogResult.OK)
+            if (dlg.ShowDialog(_statusForm) == DialogResult.OK)
             {
                 _markerService.AddMarker(dlg.NoteText, "User");
                 _notificationPresenter.ShowMarkerAdded(DateTime.Now);
@@ -721,7 +723,8 @@ public sealed class TrayApplicationContext : ApplicationContext
             },
             showSettingsAction: ShowSettingsDialog,
             showLibraryAction: ShowLibraryDialog,
-            exitAction: RequestExit);
+            exitAction: RequestExit,
+            owner: _statusForm);
 
         // Show context menu near mouse cursor
         _trayMenu = menu;
@@ -732,7 +735,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (_libraryForm == null || _libraryForm.IsDisposed)
         {
-            _libraryForm = new LibraryForm(_sessionStore, _controller, _settingsService, _playerLauncher, _clipExporter);
+            // See the matching comment in ShowSettingsDialog: owning it to the status flyout keeps
+            // it from opening behind that always-topmost window.
+            _libraryForm = new LibraryForm(_sessionStore, _controller, _settingsService, _playerLauncher, _clipExporter) { Owner = _statusForm };
         }
 
         if (!_libraryForm.Visible)
@@ -752,7 +757,11 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (_settingsForm == null || _settingsForm.IsDisposed)
         {
-            _settingsForm = new SettingsForm(_settingsService, _audioEngine);
+            // Owning it to the status flyout keeps Settings from opening behind it: the flyout is
+            // always topmost, and an unowned window has no guaranteed place above that. Owning it
+            // also stops the flyout's own "hide when something else is focused" logic from pulling
+            // itself away the moment Settings opens (see StatusForm's Deactivate handler).
+            _settingsForm = new SettingsForm(_settingsService, _audioEngine) { Owner = _statusForm };
         }
 
         if (!_settingsForm.Visible)
