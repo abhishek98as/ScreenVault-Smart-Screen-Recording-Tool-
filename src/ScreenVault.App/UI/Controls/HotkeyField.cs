@@ -114,8 +114,10 @@ public sealed class HotkeyField : Control, IThemeAware
             return true;
         }
 
+        // A global shortcut without Ctrl or Alt would steal normal typing everywhere (Shift+A is
+        // just a capital A), so only function keys may go without them.
         var isFunctionKey = key >= Keys.F1 && key <= Keys.F24;
-        if ((modifiers & (Keys.Control | Keys.Alt | Keys.Shift)) == Keys.None && !isFunctionKey)
+        if ((modifiers & (Keys.Control | Keys.Alt)) == Keys.None && !isFunctionKey)
         {
             _invalidAttempt = true;
             Invalidate();
@@ -213,7 +215,7 @@ public sealed class HotkeyField : Control, IThemeAware
         var x = _readOnly ? 0 : (int)(8 * scale);
         if (Focused && _pendingModifiers == Keys.None)
         {
-            var hint = _invalidAttempt ? "Add Ctrl, Alt or Shift" : "Press a shortcut…";
+            var hint = _invalidAttempt ? "Add Ctrl or Alt" : "Press a shortcut…";
             TextRenderer.DrawText(g, hint, Font, new Rectangle(x + (int)(2 * scale), 0, Width - x, Height), _invalidAttempt ? p.WarningText : p.TextTertiary,
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
             return;

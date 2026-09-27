@@ -173,7 +173,7 @@ public sealed class FirstRunWizardForm : ModernForm
 
         var locations = _settingsService.Current.Storage.Locations;
         _txtPrimaryStorage.Text = locations.Count > 0 ? locations[0].Path : @"%USERPROFILE%\Videos\Screen Recordings";
-        _txtBackupStorage.Text = locations.Count > 1 ? locations[1].Path : @"D:\ScreenVault Backup";
+        _txtBackupStorage.Text = locations.Count > 1 ? locations[1].Path : string.Empty;
         _txtBackupStorage.PlaceholderText = "Optional — a folder on another drive";
 
         AddLocationEditor(page, "Primary folder", _txtPrimaryStorage, _barPrimary, _lblPrimaryFree, 136);
@@ -307,6 +307,12 @@ public sealed class FirstRunWizardForm : ModernForm
             return;
         }
 
+        // Don't leave the storage step with a folder ScreenVault could never write to.
+        if (delta > 0 && _currentStep == 2 && !ValidateStorage())
+        {
+            return;
+        }
+
         ShowStep(target);
     }
 
@@ -328,7 +334,7 @@ public sealed class FirstRunWizardForm : ModernForm
         {
             case 3:
                 _privacyWarning.Visible = !MicPrivacyChecker.IsMicrophoneAccessAllowed();
-                _audioEngine.SetMonitoring(true);
+                _audioEngine.SetMonitoring(this, true);
                 _vuTimer.Start();
                 break;
             case 4:
@@ -354,7 +360,7 @@ public sealed class FirstRunWizardForm : ModernForm
     private void StopVuTimer()
     {
         _vuTimer.Stop();
-        _audioEngine.SetMonitoring(false);
+        _audioEngine.SetMonitoring(this, false);
     }
 
     private void UpdateAudioCheck()
@@ -397,6 +403,7 @@ public sealed class FirstRunWizardForm : ModernForm
         var primary = DescribeDrive(_txtPrimaryStorage.Text, _barPrimary, _lblPrimaryFree);
         var backup = DescribeDrive(_txtBackupStorage.Text, _barBackup, _lblBackupFree);
 
+        _lblStorageWarning.Tone = TextTone.Warning;
         if (string.IsNullOrWhiteSpace(_txtBackupStorage.Text))
         {
             _lblStorageWarning.Text = "Without a backup folder, recording stops if the primary drive fills up.";
@@ -482,32 +489,92 @@ public sealed class FirstRunWizardForm : ModernForm
         }
     }
 
-    private void SaveAndFinish()
+    private bool ValidateStorage()
     {
+        string? problem = null;
+        if (!IsUsableFolder(_txtPrimaryStorage.Text))
+        {
+            problem = "Enter a full folder path for recordings, like D:\\Recordings, or pick one with Browse.";
+        }
+        else if (!string.IsNullOrWhiteSpace(_txtBackupStorage.Text) && !IsUsableFolder(_txtBackupStorage.Text))
+        {
+            problem = "The backup folder needs a full path too, like E:\\Recordings — or leave it empty.";
+        }
+
+        if (problem == null)
+        {
+            return true;
+        }
+
+        _lblStorageWarning.Text = problem;
+        _lblStorageWarning.Tone = TextTone.Danger;
+        return false;
+    }
+
+    private static bool IsUsableFolder(string rawPath)
+    {
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
+            return false;
+        }
+
         try
         {
-            var settings = _settingsService.Current;
+            var expanded = Environment.ExpandEnvironmentVariables(rawPath.Trim());
+            return Path.IsPathRooted(expanded) && !string.IsNullOrEmpty(Path.GetPathRoot(expanded)) && expanded.IndexOfAny(Path.GetInvalidPathChars()) < 0;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
 
-            if (!string.IsNullOrWhiteSpace(_txtPrimaryStorage.Text) && settings.Storage.Locations.Count > 0)
+    private void SaveAndFinish()
+    {
+        if (!ValidateStorage())
+        {
+            ShowStep(2);
+            return;
+        }
+
+        try
+        {
+            // Edit a copy: the live settings only change once everything has been saved.
+            var settings = _settingsService.Current.Clone();
+
+            var primary = _txtPrimaryStorage.Text.Trim();
+            if (settings.Storage.Locations.Count > 0)
             {
-                settings.Storage.Locations[0].Path = _txtPrimaryStorage.Text.Trim();
+                settings.Storage.Locations[0].Path = primary;
+                settings.Storage.Locations[0].Enabled = true;
+            }
+            else
+            {
+                settings.Storage.Locations.Add(new StorageLocationConfig { Path = primary, MinFreeGb = 5, Enabled = true });
             }
 
-            if (!string.IsNullOrWhiteSpace(_txtBackupStorage.Text))
+            var backup = _txtBackupStorage.Text.Trim();
+            if (!string.IsNullOrWhiteSpace(backup))
             {
                 if (settings.Storage.Locations.Count > 1)
                 {
-                    settings.Storage.Locations[1].Path = _txtBackupStorage.Text.Trim();
+                    settings.Storage.Locations[1].Path = backup;
+                    settings.Storage.Locations[1].Enabled = true;
                 }
                 else
                 {
                     settings.Storage.Locations.Add(new StorageLocationConfig
                     {
-                        Path = _txtBackupStorage.Text.Trim(),
+                        Path = backup,
                         MinFreeGb = 5,
                         Enabled = true
                     });
                 }
+            }
+            else if (settings.Storage.Locations.Count > 1)
+            {
+                // The user cleared the backup folder: stop using it.
+                settings.Storage.Locations.RemoveAt(1);
             }
 
             settings.General.StartRecordingOnLaunch = _chkAutoStart.Checked;

@@ -51,20 +51,24 @@ public static class TrayMenuBuilder
         };
         menu.Items.Add(new MenuHeaderItem(stateText, emphasized: true, dotColor: dotColor));
 
+        // Where the next part goes: the active location, or the primary one before the first recording.
         var storageStatus = storageManager?.GetStatus();
         var activePath = storageStatus?.ActiveLocationPath ?? string.Empty;
-        var activeLoc = storageStatus?.Locations.FirstOrDefault(l => string.Equals(l.Path, activePath, StringComparison.OrdinalIgnoreCase));
-        var locDisplay = string.IsNullOrEmpty(activePath) ? "default folder" : Environment.ExpandEnvironmentVariables(activePath);
-        var freeText = activeLoc != null ? $" · {StorageMeterList.FormatBytes(activeLoc.AvailableFreeBytes)} free" : string.Empty;
+        var activeLoc = storageStatus?.Locations.FirstOrDefault(l => string.Equals(l.ExpandedPath, activePath, StringComparison.OrdinalIgnoreCase))
+                        ?? storageStatus?.Locations.FirstOrDefault(l => l.Enabled);
+        var locDisplay = activeLoc?.ExpandedPath
+                         ?? Environment.ExpandEnvironmentVariables(settings.Storage.Locations.FirstOrDefault(l => l.Enabled)?.Path ?? "default folder");
+        var freeText = activeLoc is { AvailableFreeBytes: > 0 } ? $" · {StorageMeterList.FormatBytes(activeLoc.AvailableFreeBytes)} free" : string.Empty;
         menu.Items.Add(new MenuHeaderItem($"Saving to {Shorten(locDisplay)}{freeText}"));
         menu.Items.Add(new ToolStripSeparator());
 
-        // 2. Primary action: Start recording / Stop & save
-        if (health.State is RecorderState.Recording or RecorderState.Paused or RecorderState.Starting)
+        // 2. Primary action: Start recording / Stop & save (also while starting or retrying)
+        if (health.Desired != DesiredState.Stopped)
         {
             var stopItem = ModernMenu.Item("Stop && save", Glyphs.Stop, async (_, _) =>
             {
-                if (!RecordingPrompts.ConfirmStop(null, settingsService))
+                if (controller.State is RecorderState.Recording or RecorderState.Paused &&
+                    !RecordingPrompts.ConfirmStop(null, settingsService))
                 {
                     return;
                 }
@@ -85,7 +89,7 @@ public static class TrayMenuBuilder
         }
 
         // 3. Pause / Resume
-        if (health.State == RecorderState.Paused)
+        if (health.Desired == DesiredState.Paused)
         {
             menu.Items.Add(ModernMenu.Item("Resume", Glyphs.Play, async (_, _) =>
             {
@@ -115,10 +119,10 @@ public static class TrayMenuBuilder
         addMarkerItem.Enabled = health.State is RecorderState.Recording or RecorderState.Paused;
         menu.Items.Add(addMarkerItem);
 
-        // 5. Mute mic in recording (FEAT-06)
+        // 5. Mute mic in recording (FEAT-06) — through the recorder so the session log notes it
         var muteMicItem = ModernMenu.Item("Mute microphone in recording", Glyphs.Microphone, (_, _) =>
         {
-            audioEngine.SetMicMute(!audioEngine.IsMicMuted);
+            controller.ToggleMicMute();
         }, HotkeyField.DisplayText(hotkeys.MuteMic));
         muteMicItem.Checked = audioEngine.IsMicMuted;
         menu.Items.Add(muteMicItem);
@@ -135,12 +139,19 @@ public static class TrayMenuBuilder
             var expanded = Environment.ExpandEnvironmentVariables(loc.Path);
             openFoldersMenu.DropDownItems.Add(ModernMenu.Item(Shorten(expanded), Glyphs.Folder, (_, _) =>
             {
-                if (!Directory.Exists(expanded))
+                try
                 {
-                    Directory.CreateDirectory(expanded);
-                }
+                    if (!Directory.Exists(expanded))
+                    {
+                        Directory.CreateDirectory(expanded);
+                    }
 
-                Process.Start("explorer.exe", $"\"{expanded}\"");
+                    Process.Start("explorer.exe", $"\"{expanded}\"");
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception or ArgumentException or NotSupportedException)
+                {
+                    ModernDialog.Warning(null, "Can't open this folder", $"{expanded}\n\n{ex.Message}");
+                }
             }));
         }
 
@@ -152,7 +163,7 @@ public static class TrayMenuBuilder
         // 7. Exit ScreenVault
         menu.Items.Add(ModernMenu.Item("Exit ScreenVault", Glyphs.Close, (_, _) =>
         {
-            if (controller.State is RecorderState.Recording or RecorderState.Paused &&
+            if (controller.Desired != DesiredState.Stopped &&
                 !RecordingPrompts.ConfirmExitWhileRecording(null))
             {
                 return;

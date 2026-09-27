@@ -39,6 +39,7 @@ public sealed class ClipExportForm : ModernForm
 
     private bool _updatingFromPreset;
     private string? _exportedFilePath;
+    private CancellationTokenSource? _exportCts;
 
     public ClipExportForm(
         SessionManifest manifest,
@@ -55,7 +56,6 @@ public sealed class ClipExportForm : ModernForm
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(560, 504);
-        TopMost = true;
 
         var totalDurationSec = _manifest.Segments.Sum(s => s.DurationSec ?? 0.0);
         if (totalDurationSec <= 0)
@@ -162,6 +162,23 @@ public sealed class ClipExportForm : ModernForm
 
         ResumeLayout(false);
         PerformLayout();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // Closing while exporting stops FFmpeg and removes the unfinished file.
+        _exportCts?.Cancel();
+        base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _exportCts?.Dispose();
+        }
+
+        base.Dispose(disposing);
     }
 
     private static TextLabel FieldLabel(string text, int x, int y) => new(text, Typography.BodyStrong) { Location = new Point(x, y) };
@@ -288,12 +305,23 @@ public sealed class ClipExportForm : ModernForm
 
         var progress = new Progress<double>(pct =>
         {
-            _progressBar.Value = (int)Math.Clamp(pct * 100, 0, 100);
+            if (!IsDisposed)
+            {
+                _progressBar.Value = (int)Math.Clamp(pct * 100, 0, 100);
+            }
         });
+
+        _exportCts?.Dispose();
+        _exportCts = new CancellationTokenSource();
 
         try
         {
-            var result = await _clipExporter.ExportClipAsync(options, progress).ConfigureAwait(true);
+            var result = await _clipExporter.ExportClipAsync(options, progress, _exportCts.Token).ConfigureAwait(true);
+            if (IsDisposed)
+            {
+                return;
+            }
+
             if (result.Success && !string.IsNullOrEmpty(result.FilePath))
             {
                 _exportedFilePath = result.FilePath;
@@ -314,13 +342,19 @@ public sealed class ClipExportForm : ModernForm
         catch (Exception ex)
         {
             Log.Warning(ex, "Clip export failed.");
-            _lblStatus.Text = $"Export error: {ex.Message}";
-            _lblStatus.Tone = TextTone.Danger;
-            ModernDialog.Error(this, "Export failed", ex.Message);
+            if (!IsDisposed)
+            {
+                _lblStatus.Text = $"Export error: {ex.Message}";
+                _lblStatus.Tone = TextTone.Danger;
+                ModernDialog.Error(this, "Export failed", ex.Message);
+            }
         }
         finally
         {
-            _btnExport.Enabled = true;
+            if (!IsDisposed)
+            {
+                _btnExport.Enabled = true;
+            }
         }
     }
 }

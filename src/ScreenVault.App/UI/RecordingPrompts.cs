@@ -25,9 +25,16 @@ internal static class RecordingPrompts
 
         if (confirmed && dontAskAgain)
         {
-            var settings = settingsService.Current;
-            settings.General.ConfirmBeforeStop = false;
-            settingsService.Save(settings);
+            try
+            {
+                var settings = settingsService.Current.Clone();
+                settings.General.ConfirmBeforeStop = false;
+                settingsService.Save(settings);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+            {
+                Serilog.Log.Warning(ex, "Could not save the \"don't ask again\" choice.");
+            }
         }
 
         return confirmed;

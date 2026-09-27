@@ -24,15 +24,24 @@ public sealed class SettingsForm : ModernForm
     private AppSettings _workingCopy;
     private int _audioPageIndex;
 
+    // Values behind the drop-downs. A value the list doesn't offer (e.g. a frame rate lowered
+    // automatically) is added as an extra entry so saving never silently changes it.
+    private readonly List<int> _frameRateValues = [15, 24, 30];
+    private readonly List<int> _splitMinuteValues = [5, 10, 15, 30, 60];
+    private readonly List<MicMode> _micModeValues = [MicMode.DefaultCommunications, MicMode.DefaultMultimedia, MicMode.None];
+    private readonly List<OutputMode> _outputModeValues = [OutputMode.DefaultPlusCommunications, OutputMode.Default, OutputMode.None];
+
     // General
     private readonly ToggleSwitch _chkStartWithWindows = new();
     private readonly ToggleSwitch _chkAutoStartRecording = new();
     private readonly ToggleSwitch _chkStartMinimized = new();
-    private readonly NumberField _numStartupDelay = new() { Minimum = 0, Maximum = 60, Suffix = "s" };
+    private readonly NumberField _numStartupDelay = new() { Minimum = 0, Maximum = 120, Suffix = "s" };
     private readonly ToggleSwitch _chkConfirmStop = new();
     private readonly ToggleSwitch _chkNotifyDevice = new();
     private readonly ToggleSwitch _chkNotifyStorage = new();
     private readonly ModernComboBox _cmbTheme = new();
+    private readonly ModernComboBox _cmbMeetingMode = new();
+    private readonly ToggleSwitch _chkPromptStopMeeting = new();
 
     // Video
     private readonly ModernComboBox _cmbFrameRate = new();
@@ -101,6 +110,7 @@ public sealed class SettingsForm : ModernForm
 
         // ── Combo box items ──────────────────────────────────────────────────────────
         _cmbTheme.Items.AddRange(["Use Windows setting", "Light", "Dark"]);
+        _cmbMeetingMode.Items.AddRange(["Ask me (recommended)", "Start recording automatically", "Do nothing"]);
         _cmbFrameRate.Items.AddRange(["15 fps (recommended)", "24 fps", "30 fps"]);
         _cmbQuality.Items.AddRange(["Small — lowest CPU and size", "Balanced (recommended)", "High — crisp small text"]);
         _cmbEncoder.Items.AddRange(["Auto", "nvenc-d3d11", "amf-d3d11", "qsv-hwmap", "nvenc-sysmem", "amf-sysmem", "qsv-sysmem", "x264"]);
@@ -109,7 +119,7 @@ public sealed class SettingsForm : ModernForm
         _cmbSplitMinutes.Items.AddRange(["5 minutes", "10 minutes (recommended)", "15 minutes", "30 minutes", "60 minutes"]);
         _cmbOutputFormat.Items.AddRange(["MKV (recommended)", "MP4 (most compatible)", "TS (raw live format)"]);
         _cmbLogLevel.Items.AddRange(["Debug", "Information", "Warning", "Error"]);
-        foreach (var combo in new[] { _cmbTheme, _cmbFrameRate, _cmbQuality, _cmbEncoder, _cmbMicMode, _cmbOutputMode, _cmbSplitMinutes, _cmbOutputFormat, _cmbLogLevel })
+        foreach (var combo in new[] { _cmbTheme, _cmbMeetingMode, _cmbFrameRate, _cmbQuality, _cmbEncoder, _cmbMicMode, _cmbOutputMode, _cmbSplitMinutes, _cmbOutputFormat, _cmbLogLevel })
         {
             combo.Width = 260;
         }
@@ -127,7 +137,7 @@ public sealed class SettingsForm : ModernForm
         var host = new SurfacePanel { Size = new Size(688, 588), Dock = DockStyle.Fill };
 
         // General
-        var general = CreatePage("General", "Startup behavior, confirmations, notifications and appearance.");
+        var general = CreatePage("General", "Startup behavior, confirmations, meetings, notifications and appearance.");
         general.Controls.Add(Section("Startup"));
         general.Controls.Add(Card(
             Row("Start with Windows", "Open ScreenVault in the notification area when you sign in.", _chkStartWithWindows, Glyphs.Monitor),
@@ -137,6 +147,10 @@ public sealed class SettingsForm : ModernForm
         general.Controls.Add(Section("Recording"));
         general.Controls.Add(Card(
             Row("Confirm before stopping", "Ask before a recording is stopped from the tray or the status window.", _chkConfirmStop, Glyphs.Stop)));
+        general.Controls.Add(Section("Meetings"));
+        general.Controls.Add(Card(
+            Row("When a call starts", "Teams, Zoom, Slack, Discord or a browser starts using the microphone while you're not recording.", _cmbMeetingMode, Glyphs.Headphones),
+            Row("Offer to stop when the call ends", "Only for recordings that were started because of that call.", _chkPromptStopMeeting, Glyphs.Stop)));
         general.Controls.Add(Section("Notifications"));
         general.Controls.Add(Card(
             Row("Audio device changes", "Notify when the microphone or speakers switch. Recording always continues.", _chkNotifyDevice, Glyphs.Headphones),
@@ -300,7 +314,9 @@ public sealed class SettingsForm : ModernForm
         var footer = new SurfacePanel { Size = new Size(688, 64), Dock = DockStyle.Bottom, TopDivider = true };
         _lblValidation.Bounds = new Rectangle(24, 22, 300, 20);
         _lblValidation.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
-        var btnCancel = new ModernButton("Cancel", ButtonKind.Secondary) { Bounds = new Rectangle(344, 16, 96, 32), Anchor = AnchorStyles.Top | AnchorStyles.Right, DialogResult = DialogResult.Cancel };
+        // This window is not modal, so a DialogResult alone would not close it.
+        var btnCancel = new ModernButton("Cancel", ButtonKind.Secondary) { Bounds = new Rectangle(344, 16, 96, 32), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        btnCancel.Click += (_, _) => Close();
         var btnApply = new ModernButton("Apply", ButtonKind.Secondary) { Bounds = new Rectangle(448, 16, 96, 32), Anchor = AnchorStyles.Top | AnchorStyles.Right };
         btnApply.Click += (_, _) => SaveWorkingCopy();
         var btnSave = new ModernButton("Save", ButtonKind.Primary, Glyphs.CheckMark) { Bounds = new Rectangle(552, 16, 112, 32), Anchor = AnchorStyles.Top | AnchorStyles.Right };
@@ -340,7 +356,7 @@ public sealed class SettingsForm : ModernForm
         FormClosing += (_, _) =>
         {
             _meterTimer.Stop();
-            _audioEngine?.SetMonitoring(false);
+            _audioEngine?.SetMonitoring(this, false);
         };
 
         LoadSettingsIntoUi();
@@ -449,7 +465,7 @@ public sealed class SettingsForm : ModernForm
         }
 
         var isAudio = index == _audioPageIndex;
-        _audioEngine?.SetMonitoring(isAudio);
+        _audioEngine?.SetMonitoring(this, isAudio);
         if (isAudio && _audioEngine != null)
         {
             _meterTimer.Start();
@@ -500,7 +516,7 @@ public sealed class SettingsForm : ModernForm
         _chkStartWithWindows.Checked = _workingCopy.General.StartWithWindows;
         _chkAutoStartRecording.Checked = _workingCopy.General.StartRecordingOnLaunch;
         _chkStartMinimized.Checked = _workingCopy.General.MinimizeToTrayOnLaunch;
-        _numStartupDelay.Value = Math.Clamp(_workingCopy.General.StartupDelaySeconds, 0, 60);
+        _numStartupDelay.Value = Math.Clamp(_workingCopy.General.StartupDelaySeconds, 0, 120);
         _chkConfirmStop.Checked = _workingCopy.General.ConfirmBeforeStop;
         _chkNotifyDevice.Checked = _workingCopy.General.Notifications.DeviceSwitch;
         _chkNotifyStorage.Checked = _workingCopy.General.Notifications.Storage;
@@ -510,14 +526,17 @@ public sealed class SettingsForm : ModernForm
             AppThemeMode.Dark => 2,
             _ => 0
         };
-
-        // Video
-        _cmbFrameRate.SelectedIndex = _workingCopy.Video.FrameRate switch
+        _cmbMeetingMode.SelectedIndex = _workingCopy.MeetingDetection.Mode switch
         {
-            24 => 1,
-            30 => 2,
+            MeetingDetectionMode.AutoStart => 1,
+            MeetingDetectionMode.Off => 2,
             _ => 0
         };
+        _chkPromptStopMeeting.Checked = _workingCopy.MeetingDetection.PromptStopWhenMeetingEnds;
+
+        // Video
+        _cmbFrameRate.SelectedIndex = SelectValue(_cmbFrameRate, _frameRateValues, _workingCopy.Video.FrameRate,
+            fps => string.Create(CultureInfo.CurrentCulture, $"{fps} fps (current)"));
 
         _cmbQuality.SelectedIndex = _workingCopy.Video.Quality switch
         {
@@ -537,18 +556,10 @@ public sealed class SettingsForm : ModernForm
         UpdateEncoderDescription(_workingCopy.Video.DetectedEncoderProfile);
 
         // Audio
-        _cmbMicMode.SelectedIndex = _workingCopy.Audio.MicMode switch
-        {
-            MicMode.DefaultMultimedia => 1,
-            MicMode.None => 2,
-            _ => 0
-        };
-        _cmbOutputMode.SelectedIndex = _workingCopy.Audio.OutputMode switch
-        {
-            OutputMode.Default => 1,
-            OutputMode.None => 2,
-            _ => 0
-        };
+        _cmbMicMode.SelectedIndex = SelectValue(_cmbMicMode, _micModeValues, _workingCopy.Audio.MicMode,
+            _ => "A specific microphone (chosen earlier)");
+        _cmbOutputMode.SelectedIndex = SelectValue(_cmbOutputMode, _outputModeValues, _workingCopy.Audio.OutputMode,
+            mode => mode == OutputMode.AllActive ? "All playback devices" : "A specific output device (chosen earlier)");
         _trkMicGain.Value = (int)Math.Clamp(_workingCopy.Audio.MicGainDb, -20, 20);
         _lblMicGainVal.Text = FormatGain(_trkMicGain.Value);
         _trkSysGain.Value = (int)Math.Clamp(_workingCopy.Audio.SystemGainDb, -20, 20);
@@ -559,14 +570,8 @@ public sealed class SettingsForm : ModernForm
         // Storage
         RefreshLocationList(selectIndex: 0);
 
-        _cmbSplitMinutes.SelectedIndex = _workingCopy.Storage.SplitMinutes switch
-        {
-            5 => 0,
-            15 => 2,
-            30 => 3,
-            60 => 4,
-            _ => 1
-        };
+        _cmbSplitMinutes.SelectedIndex = SelectValue(_cmbSplitMinutes, _splitMinuteValues, _workingCopy.Storage.SplitMinutes,
+            minutes => string.Create(CultureInfo.CurrentCulture, $"{minutes} minutes (current)"));
 
         _cmbOutputFormat.SelectedIndex = _workingCopy.Storage.OutputFormat switch
         {
@@ -669,13 +674,15 @@ public sealed class SettingsForm : ModernForm
             2 => AppThemeMode.Dark,
             _ => AppThemeMode.System
         };
-
-        _workingCopy.Video.FrameRate = _cmbFrameRate.SelectedIndex switch
+        _workingCopy.MeetingDetection.Mode = _cmbMeetingMode.SelectedIndex switch
         {
-            1 => 24,
-            2 => 30,
-            _ => 15
+            1 => MeetingDetectionMode.AutoStart,
+            2 => MeetingDetectionMode.Off,
+            _ => MeetingDetectionMode.Ask
         };
+        _workingCopy.MeetingDetection.PromptStopWhenMeetingEnds = _chkPromptStopMeeting.Checked;
+
+        _workingCopy.Video.FrameRate = ValueAt(_frameRateValues, _cmbFrameRate.SelectedIndex, 15);
 
         _workingCopy.Video.Quality = _cmbQuality.SelectedIndex switch
         {
@@ -688,33 +695,15 @@ public sealed class SettingsForm : ModernForm
         _workingCopy.Video.CaptureCursor = _chkCaptureCursor.Checked;
         _workingCopy.Video.DownscaleTo1080p = _chkDownscale.Checked;
 
-        _workingCopy.Audio.MicMode = _cmbMicMode.SelectedIndex switch
-        {
-            1 => MicMode.DefaultMultimedia,
-            2 => MicMode.None,
-            _ => MicMode.DefaultCommunications
-        };
-
-        _workingCopy.Audio.OutputMode = _cmbOutputMode.SelectedIndex switch
-        {
-            1 => OutputMode.Default,
-            2 => OutputMode.None,
-            _ => OutputMode.DefaultPlusCommunications
-        };
+        _workingCopy.Audio.MicMode = ValueAt(_micModeValues, _cmbMicMode.SelectedIndex, MicMode.DefaultCommunications);
+        _workingCopy.Audio.OutputMode = ValueAt(_outputModeValues, _cmbOutputMode.SelectedIndex, OutputMode.DefaultPlusCommunications);
 
         _workingCopy.Audio.MicGainDb = _trkMicGain.Value;
         _workingCopy.Audio.SystemGainDb = _trkSysGain.Value;
         _workingCopy.Audio.JitterTargetMs = (int)_numJitterBuffer.Value;
         _workingCopy.Audio.AvOffsetMs = (int)_numAvOffset.Value;
 
-        _workingCopy.Storage.SplitMinutes = _cmbSplitMinutes.SelectedIndex switch
-        {
-            0 => 5,
-            2 => 15,
-            3 => 30,
-            4 => 60,
-            _ => 10
-        };
+        _workingCopy.Storage.SplitMinutes = ValueAt(_splitMinuteValues, _cmbSplitMinutes.SelectedIndex, 10);
 
         _workingCopy.Storage.OutputFormat = _cmbOutputFormat.SelectedIndex switch
         {
@@ -763,9 +752,23 @@ public sealed class SettingsForm : ModernForm
             return false;
         }
 
+        try
+        {
+            _settingsService.Save(_workingCopy);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            Log.Warning(ex, "Could not save settings.");
+            _lblValidation.Text = $"Could not save: {ex.Message}";
+            _toolTip.SetToolTip(_lblValidation, ex.Message);
+            return false;
+        }
+
         _lblValidation.Text = string.Empty;
-        _settingsService.Save(_workingCopy);
         Theme.SetMode(_workingCopy.General.Theme);
+
+        // The saved object is now the app's live settings: keep editing a private copy.
+        _workingCopy = CloneSettings(_workingCopy);
 
         // Update StartWithWindows registry if changed
         try
@@ -786,8 +789,14 @@ public sealed class SettingsForm : ModernForm
         _btnRedetectEncoder.Text = "Testing…";
         try
         {
-            var paths = new FfmpegLocator().Locate();
+            var customPath = string.IsNullOrWhiteSpace(_txtFfmpegPath.Text) ? null : _txtFfmpegPath.Text.Trim();
+            var paths = await Task.Run(() => new FfmpegLocator().Locate(customPath)).ConfigureAwait(true);
             var result = await EncoderProbe.ProbeAsync(paths.FfmpegPath).ConfigureAwait(true);
+            if (IsDisposed)
+            {
+                return;
+            }
+
             _workingCopy.Video.DetectedEncoderProfile = result.ProfileName;
             _workingCopy.Video.EncoderFingerprint = result.Fingerprint;
             RefreshProbeDetails(result.Details);
@@ -797,12 +806,18 @@ public sealed class SettingsForm : ModernForm
         catch (Exception ex)
         {
             Log.Warning(ex, "Encoder probe failed.");
-            ModernDialog.Warning(this, "Encoder test failed", ex.Message);
+            if (!IsDisposed)
+            {
+                ModernDialog.Warning(this, "Encoder test failed", ex.Message);
+            }
         }
         finally
         {
-            _btnRedetectEncoder.Text = "Detect now";
-            _btnRedetectEncoder.Enabled = true;
+            if (!IsDisposed)
+            {
+                _btnRedetectEncoder.Text = "Detect now";
+                _btnRedetectEncoder.Enabled = true;
+            }
         }
     }
 
@@ -1077,6 +1092,23 @@ public sealed class SettingsForm : ModernForm
             LoadSettingsIntoUi();
         }
     }
+
+    /// <summary>Selects <paramref name="value"/>, adding it (with <paramref name="label"/>) if the list lacks it.</summary>
+    private static int SelectValue<T>(ModernComboBox combo, List<T> values, T value, Func<T, string> label)
+    {
+        var index = values.IndexOf(value);
+        if (index < 0)
+        {
+            values.Add(value);
+            combo.Items.Add(label(value));
+            index = values.Count - 1;
+        }
+
+        return index;
+    }
+
+    private static T ValueAt<T>(List<T> values, int index, T fallback) =>
+        index >= 0 && index < values.Count ? values[index] : fallback;
 
     private static AppSettings CloneSettings(AppSettings source)
     {

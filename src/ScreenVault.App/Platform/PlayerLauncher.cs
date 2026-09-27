@@ -42,13 +42,13 @@ public sealed class PlayerLauncher
 
         if (chosen == PlaybackPlayer.Vlc)
         {
-            var vlc = FindVlcPath();
+            var vlc = SafeFindVlcPath();
             if (vlc != null) return new ResolvedPlayer(ResolvedPlayerType.Vlc, vlc);
         }
 
         if (chosen == PlaybackPlayer.Ffplay)
         {
-            var ffplay = FindFfplayPath(settings);
+            var ffplay = SafeFindFfplayPath(settings);
             if (ffplay != null) return new ResolvedPlayer(ResolvedPlayerType.Ffplay, ffplay);
         }
 
@@ -59,14 +59,14 @@ public sealed class PlayerLauncher
 
         // Auto resolution order:
         // 1. VLC
-        var autoVlc = FindVlcPath();
+        var autoVlc = SafeFindVlcPath();
         if (autoVlc != null)
         {
             return new ResolvedPlayer(ResolvedPlayerType.Vlc, autoVlc);
         }
 
         // 2. Bundled ffplay.exe
-        var autoFfplay = FindFfplayPath(settings);
+        var autoFfplay = SafeFindFfplayPath(settings);
         if (autoFfplay != null)
         {
             return new ResolvedPlayer(ResolvedPlayerType.Ffplay, autoFfplay);
@@ -161,6 +161,33 @@ public sealed class PlayerLauncher
             Log.Error(ex, "Failed to launch video player for {Path}", filePath);
             UI.ModernDialog.Error(null, "Couldn't start the video player", ex.Message);
             return false;
+        }
+    }
+
+    private static string? SafeFindVlcPath()
+    {
+        try
+        {
+            return FindVlcPath();
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Could not look up VLC.");
+            return null;
+        }
+    }
+
+    private static string? SafeFindFfplayPath(AppSettings settings)
+    {
+        try
+        {
+            return FindFfplayPath(settings);
+        }
+        catch (Exception ex)
+        {
+            // FfmpegLocator throws when FFmpeg is missing; that only means ffplay isn't available.
+            Log.Debug(ex, "Could not look up ffplay.");
+            return null;
         }
     }
 

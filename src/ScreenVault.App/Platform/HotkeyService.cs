@@ -6,7 +6,8 @@ namespace ScreenVault.App.Platform;
 
 public interface IHotkeyService : IDisposable
 {
-    void RegisterHotkeys();
+    /// <summary>Registers all shortcuts; returns the ones Windows refused (usually taken by another app).</summary>
+    IReadOnlyList<string> RegisterHotkeys();
     void UnregisterHotkeys();
     event EventHandler? StartStopPressed;
     event EventHandler? MuteMicPressed;
@@ -51,25 +52,27 @@ public sealed class HotkeyService : IHotkeyService
         _window = new HotkeyWindow(OnWmHotkey);
     }
 
-    public void RegisterHotkeys()
+    public IReadOnlyList<string> RegisterHotkeys()
     {
         UnregisterHotkeys();
 
         var hotkeys = _settingsService.Current.Hotkeys;
+        var failed = new List<string>();
 
         // Default: Ctrl+Alt+Shift+R -> Keys.R
-        RegisterParsedHotkey(IdStartStop, hotkeys.StartStop, Keys.R);
+        RegisterParsedHotkey(IdStartStop, hotkeys.StartStop, Keys.R, failed);
         // Default: Ctrl+Alt+Shift+X -> Keys.X
-        RegisterParsedHotkey(IdMuteMic, hotkeys.MuteMic, Keys.X);
+        RegisterParsedHotkey(IdMuteMic, hotkeys.MuteMic, Keys.X, failed);
         // Default: Ctrl+Alt+Shift+M -> Keys.M (0x4D)
-        RegisterParsedHotkey(IdAddMarker, hotkeys.AddMarker, Keys.M);
+        RegisterParsedHotkey(IdAddMarker, hotkeys.AddMarker, Keys.M, failed);
         // Default: Ctrl+Alt+Shift+P -> Keys.P (0x50)
-        RegisterParsedHotkey(IdPauseResume, hotkeys.PauseResume, Keys.P);
+        RegisterParsedHotkey(IdPauseResume, hotkeys.PauseResume, Keys.P, failed);
         // Default: Ctrl+Alt+Shift+S -> Keys.S (0x53)
-        RegisterParsedHotkey(IdShowStatus, hotkeys.ShowStatus, Keys.S);
+        RegisterParsedHotkey(IdShowStatus, hotkeys.ShowStatus, Keys.S, failed);
+        return failed;
     }
 
-    private void RegisterParsedHotkey(int id, string hotkeyString, Keys defaultKey)
+    private void RegisterParsedHotkey(int id, string hotkeyString, Keys defaultKey, List<string> failed)
     {
         var (modifiers, key) = ParseHotkey(hotkeyString, defaultKey);
         var success = RegisterHotKey(_window.Handle, id, modifiers | ModNorepeat, (uint)key);
@@ -81,6 +84,7 @@ public sealed class HotkeyService : IHotkeyService
         {
             var err = Marshal.GetLastWin32Error();
             Log.Warning("Failed to register global hotkey {KeyStr} (id: {Id}, Win32Error: {Err})", hotkeyString, id, err);
+            failed.Add(string.IsNullOrWhiteSpace(hotkeyString) ? $"Ctrl+Alt+Shift+{defaultKey}" : hotkeyString);
         }
     }
 
@@ -109,7 +113,12 @@ public sealed class HotkeyService : IHotkeyService
             {
                 mod |= ModShift;
             }
-            else if (Enum.TryParse<Keys>(p, ignoreCase: true, out var parsedKey))
+            else if (p.Length == 1 && char.IsAsciiDigit(p[0]))
+            {
+                // "1" would otherwise parse as the numeric value 1 (the left mouse button).
+                key = Keys.D0 + (p[0] - '0');
+            }
+            else if (!char.IsAsciiDigit(p[0]) && Enum.TryParse<Keys>(p, ignoreCase: true, out var parsedKey) && parsedKey > Keys.XButton2)
             {
                 key = parsedKey;
             }

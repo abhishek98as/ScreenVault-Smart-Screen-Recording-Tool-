@@ -469,13 +469,12 @@ public sealed class LibraryForm : ModernForm
         _valParts.Text = s.Segments.Count.ToString(CultureInfo.CurrentCulture);
         _valMarkers.Text = s.Markers.Count.ToString(CultureInfo.CurrentCulture);
 
-        _btnMerge.Enabled = s.Segments.Count > 1 && string.IsNullOrEmpty(s.MergedPath);
+        _btnMerge.Enabled = s.Segments.Count > 1 && !MergedFileExists(s);
         _btnProtect.Text = s.Protected ? "Unprotect" : "Protect";
         _btnProtect.Glyph = s.Protected ? Glyphs.Unlock : Glyphs.Lock;
 
         // Delete allowed only if not the active recording session
-        var isActive = _controller.State != RecorderState.Idle &&
-                       (_controller.Health.CurrentFilePath?.Contains(s.SessionId, StringComparison.OrdinalIgnoreCase) ?? false);
+        var isActive = IsBeingRecorded(s);
         _btnDelete.Enabled = !isActive;
         _toolTip.SetToolTip(_btnDelete, isActive ? "This session is still being recorded" : "Move this recording to the Recycle Bin (Del)");
 
@@ -517,6 +516,49 @@ public sealed class LibraryForm : ModernForm
 
         _lstEvents.EndUpdate();
         ShowDetailTab(_tabs.SelectedIndex);
+    }
+
+    private bool IsBeingRecorded(SessionManifest session) =>
+        _controller.Desired != DesiredState.Stopped &&
+        (string.Equals(session.Status, "Recording", StringComparison.OrdinalIgnoreCase) ||
+         (_controller.Health.CurrentFilePath?.Contains(session.SessionId, StringComparison.OrdinalIgnoreCase) ?? false));
+
+    private static bool MergedFileExists(SessionManifest session)
+    {
+        if (string.IsNullOrEmpty(session.MergedPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            return File.Exists(Path.GetFullPath(Environment.ExpandEnvironmentVariables(session.MergedPath)));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Saves a change atomically and mirrors it into the copy shown in the list.</summary>
+    private bool UpdateSession(SessionManifest session, Action<SessionManifest> change)
+    {
+        try
+        {
+            _sessionStore.Update(session.SessionId, m =>
+            {
+                change(m);
+                return true;
+            });
+            change(session);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Could not update session {SessionId}", session.SessionId);
+            ModernDialog.Error(this, "Could not save the change", ex.Message);
+            return false;
+        }
     }
 
     private static string DisplayTitle(SessionManifest session) =>
@@ -693,12 +735,15 @@ public sealed class LibraryForm : ModernForm
         try
         {
             var merger = new SessionMerger(_sessionStore, new FfprobeClient(), new ChapterWriter());
-            var res = await merger.MergeSessionAsync(_selectedSession.SessionId).ConfigureAwait(true);
+            var session = _selectedSession;
+            var res = await merger.MergeSessionAsync(session.SessionId).ConfigureAwait(true);
             if (res.Success && !string.IsNullOrEmpty(res.MergedFilePath))
             {
-                _selectedSession.MergedPath = res.MergedFilePath;
-                _selectedSession.MergeStatus = "Done";
-                _sessionStore.Save(_selectedSession);
+                UpdateSession(session, m =>
+                {
+                    m.MergedPath = res.MergedFilePath;
+                    m.MergeStatus = "Done";
+                });
                 ModernDialog.Success(this, "Parts merged", $"Saved as {Path.GetFileName(res.MergedFilePath)} in the same folder.");
                 await LoadSessionsAsync();
             }
@@ -726,18 +771,23 @@ public sealed class LibraryForm : ModernForm
         var newTitle = ModernDialog.Prompt(this, "Rename recording", "Give this recording a title that's easy to search for.", _selectedSession.Title ?? string.Empty, "Rename", "e.g. Sprint planning");
         if (string.IsNullOrWhiteSpace(newTitle)) return;
 
-        _selectedSession.Title = newTitle.Trim();
-        _sessionStore.Save(_selectedSession);
-        FilterSessions();
+        var title = newTitle.Trim();
+        if (title.Length > 120) title = title[..120].TrimEnd();
+        if (UpdateSession(_selectedSession, m => m.Title = title))
+        {
+            FilterSessions();
+        }
     }
 
     private void ToggleProtectSelected()
     {
         if (_selectedSession == null) return;
 
-        _selectedSession.Protected = !_selectedSession.Protected;
-        _sessionStore.Save(_selectedSession);
-        FilterSessions();
+        var protect = !_selectedSession.Protected;
+        if (UpdateSession(_selectedSession, m => m.Protected = protect))
+        {
+            FilterSessions();
+        }
     }
 
     private void DeleteSelectedSession()
@@ -766,7 +816,7 @@ public sealed class LibraryForm : ModernForm
                 var fullFinal = Path.IsPathRooted(seg.FinalPath)
                     ? seg.FinalPath
                     : Path.GetFullPath(Path.Combine(expLocation, seg.FinalPath));
-                if (File.Exists(fullFinal)) filesToDelete.Add(fullFinal);
+                if (File.Exists(fullFinal) && !filesToDelete.Contains(fullFinal, StringComparer.OrdinalIgnoreCase)) filesToDelete.Add(fullFinal);
             }
 
             if (!string.IsNullOrEmpty(seg.TsPath))
@@ -774,11 +824,27 @@ public sealed class LibraryForm : ModernForm
                 var fullTs = Path.IsPathRooted(seg.TsPath)
                     ? seg.TsPath
                     : Path.GetFullPath(Path.Combine(expLocation, seg.TsPath));
-                if (File.Exists(fullTs)) filesToDelete.Add(fullTs);
+                if (File.Exists(fullTs) && !filesToDelete.Contains(fullTs, StringComparer.OrdinalIgnoreCase)) filesToDelete.Add(fullTs);
             }
         }
 
-        var totalBytes = filesToDelete.Sum(f => new FileInfo(f).Length);
+        var totalBytes = filesToDelete.Sum(f =>
+        {
+            try
+            {
+                return new FileInfo(f).Length;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return 0L;
+            }
+        });
+
+        if (IsBeingRecorded(_selectedSession))
+        {
+            ModernDialog.Info(this, "This recording is still running", "Stop the recording first, then delete it.");
+            return;
+        }
         var confirmed = ModernDialog.Confirm(this,
             "Delete this recording?",
             $"{filesToDelete.Count} file{(filesToDelete.Count == 1 ? string.Empty : "s")} ({FormatSize(totalBytes)}) will be moved to the Recycle Bin, so you can still restore them.",

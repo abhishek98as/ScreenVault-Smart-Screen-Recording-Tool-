@@ -38,6 +38,7 @@ public sealed class SavedDialog : ModernForm
 
     private string _targetFilePath;
     private bool _isFinalizing;
+    private string? _mergeError;
 
     public SavedDialog(
         SessionManifest manifest,
@@ -145,6 +146,13 @@ public sealed class SavedDialog : ModernForm
 
         Controls.AddRange([_badge, _lblHeadline, _lblSubtitle, lblTitlePrompt, _txtTitle, _btnRename, infoCard, _lblStatus, _progressBar, footer]);
 
+        // Come to the front once so the user sees it, but don't stay above other apps afterwards.
+        Shown += (_, _) =>
+        {
+            Activate();
+            TopMost = false;
+        };
+
         KeyDown += (_, e) =>
         {
             if (e.KeyCode == Keys.Escape)
@@ -170,13 +178,14 @@ public sealed class SavedDialog : ModernForm
             SetFileActionsEnabled(false);
             UpdateInfoDisplay();
 
-            _ = finalizeTask.ContinueWith(_ =>
+            _ = finalizeTask.ContinueWith(task =>
             {
+                var mergeResult = task.IsCompletedSuccessfully ? task.Result : null;
                 if (!IsDisposed)
                 {
                     try
                     {
-                        BeginInvoke(OnFinalizationComplete);
+                        BeginInvoke(() => OnFinalizationComplete(mergeResult));
                     }
                     catch (InvalidOperationException)
                     {
@@ -244,11 +253,12 @@ public sealed class SavedDialog : ModernForm
         }
     }
 
-    private void OnFinalizationComplete()
+    private void OnFinalizationComplete(MergeResult? mergeResult)
     {
         if (IsDisposed) return;
 
         _isFinalizing = false;
+        _mergeError = mergeResult is { Success: false } ? mergeResult.ErrorMessage ?? "unknown error" : null;
         _progressBar.Marquee = false;
         _progressBar.Visible = false;
 
@@ -315,7 +325,17 @@ public sealed class SavedDialog : ModernForm
             _badge.Tone = Tone.Success;
             _lblHeadline.Text = "Recording saved";
             _lblSubtitle.Text = File.Exists(_targetFilePath) ? "Everything is safely on disk." : "The file will appear once post-processing finishes.";
-            _lblStatus.Text = string.Empty;
+            if (_mergeError != null)
+            {
+                // The parts are all there; only joining them into one file failed.
+                _lblStatus.Text = "The parts couldn't be joined into one file, so they were kept as separate files. You can try again from Recordings → Merge parts.";
+                _lblStatus.Tone = TextTone.Warning;
+                _toolTip.SetToolTip(_lblStatus, _mergeError);
+            }
+            else
+            {
+                _lblStatus.Text = string.Empty;
+            }
         }
     }
 
@@ -358,21 +378,85 @@ public sealed class SavedDialog : ModernForm
 
     private void OnRenameClicked(object? sender, EventArgs e)
     {
+        // The title is a display name: keep it as typed (file names are made safe where they're built).
         var newTitle = _txtTitle.Text.Trim();
         if (string.IsNullOrWhiteSpace(newTitle)) return;
+        if (newTitle.Length > 120) newTitle = newTitle[..120].TrimEnd();
 
-        // Sanitize title
-        var invalid = Path.GetInvalidFileNameChars();
-        var sanitized = string.Concat(newTitle.Select(c => invalid.Contains(c) ? '-' : c))
-            .Replace(" ", "-", StringComparison.Ordinal);
-        if (sanitized.Length > 60) sanitized = sanitized[..60];
-
-        _manifest.Title = sanitized;
-        _sessionStore?.Save(_manifest);
+        try
+        {
+            // Atomic update: merging may be saving the same session in the background right now.
+            _sessionStore?.Update(_manifest.SessionId, m =>
+            {
+                m.Title = newTitle;
+                return true;
+            });
+            _manifest.Title = newTitle;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Could not save the recording title.");
+            ModernDialog.Error(this, "Could not save the title", ex.Message);
+            return;
+        }
 
         UpdateInfoDisplay();
-        _lblStatus.Text = $"Title saved as \"{sanitized}\".";
+        _lblStatus.Text = $"Title saved as \"{newTitle}\".";
         _lblStatus.Tone = TextTone.Success;
+    }
+
+    private async Task CopyWithProgressAsync(string sourcePath, string destPath, long totalBytes)
+    {
+        var buffer = new byte[4 * 1024 * 1024]; // 4 MB buffer
+        await using var srcStream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, buffer.Length, useAsync: true);
+        await using var destStream = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, buffer.Length, useAsync: true);
+
+        long copiedBytes = 0;
+        int read;
+        while ((read = await srcStream.ReadAsync(buffer).ConfigureAwait(false)) > 0)
+        {
+            await destStream.WriteAsync(buffer.AsMemory(0, read)).ConfigureAwait(false);
+            copiedBytes += read;
+            var percent = totalBytes > 0 ? (int)(copiedBytes * 100 / totalBytes) : 0;
+            if (!IsDisposed && IsHandleCreated)
+            {
+                BeginInvoke(() => _progressBar.Value = Math.Clamp(percent, 0, 100));
+            }
+        }
+    }
+
+    /// <summary>Points the session at the file's new place so Recordings can still play it.</summary>
+    private void RememberMovedFile(string oldPath, string newPath)
+    {
+        try
+        {
+            _sessionStore?.Update(_manifest.SessionId, m =>
+            {
+                if (!string.IsNullOrEmpty(m.MergedPath) &&
+                    string.Equals(Path.GetFullPath(Environment.ExpandEnvironmentVariables(m.MergedPath)), oldPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    m.MergedPath = newPath;
+                    return true;
+                }
+
+                foreach (var segment in m.Segments)
+                {
+                    var location = Path.GetFullPath(Environment.ExpandEnvironmentVariables(segment.Location));
+                    var finalPath = string.IsNullOrEmpty(segment.FinalPath) ? null : Path.GetFullPath(Path.Combine(location, segment.FinalPath));
+                    if (finalPath != null && string.Equals(finalPath, oldPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        segment.FinalPath = newPath;
+                        return true;
+                    }
+                }
+
+                return false;
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Could not update the session after moving {Path}", oldPath);
+        }
     }
 
     private async Task OnSaveCopyClickedAsync(bool isMove)
@@ -393,6 +477,11 @@ public sealed class SavedDialog : ModernForm
         if (sfd.ShowDialog(this) != DialogResult.OK) return;
 
         var destPath = sfd.FileName;
+        if (string.Equals(Path.GetFullPath(destPath), Path.GetFullPath(_targetFilePath), StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
         _progressBar.Marquee = false;
         _progressBar.Value = 0;
         _progressBar.Visible = true;
@@ -400,39 +489,43 @@ public sealed class SavedDialog : ModernForm
         _lblStatus.Tone = TextTone.Secondary;
         SetFileActionsEnabled(false);
 
+        var sourcePath = _targetFilePath;
         try
         {
-            var totalBytes = new FileInfo(_targetFilePath).Length;
-            long copiedBytes = 0;
+            var totalBytes = new FileInfo(sourcePath).Length;
 
-            await Task.Run(async () =>
+            // Same drive: a move is just a rename, no need to copy gigabytes.
+            var sameVolume = string.Equals(
+                Path.GetPathRoot(Path.GetFullPath(destPath)),
+                Path.GetPathRoot(Path.GetFullPath(sourcePath)),
+                StringComparison.OrdinalIgnoreCase);
+
+            if (isMove && sameVolume)
             {
-                var buffer = new byte[4 * 1024 * 1024]; // 4 MB buffer
-                await using var srcStream = new FileStream(_targetFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, buffer.Length, useAsync: true);
-                await using var destStream = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, buffer.Length, useAsync: true);
+                await Task.Run(() => File.Move(sourcePath, destPath, overwrite: true));
+            }
+            else
+            {
+                await Task.Run(() => CopyWithProgressAsync(sourcePath, destPath, totalBytes));
 
-                int read;
-                while ((read = await srcStream.ReadAsync(buffer).ConfigureAwait(false)) > 0)
+                if (isMove)
                 {
-                    await destStream.WriteAsync(buffer.AsMemory(0, read)).ConfigureAwait(false);
-                    copiedBytes += read;
-                    var percent = totalBytes > 0 ? (int)(copiedBytes * 100 / totalBytes) : 0;
-                    BeginInvoke(() => _progressBar.Value = Math.Clamp(percent, 0, 100));
+                    try
+                    {
+                        File.Delete(sourcePath);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning(ex, "Could not delete original file after move.");
+                    }
                 }
-            });
+            }
 
             if (isMove)
             {
-                try
-                {
-                    File.Delete(_targetFilePath);
-                    _targetFilePath = destPath;
-                    UpdateInfoDisplay();
-                }
-                catch (Exception ex)
-                {
-                    Log.Warning(ex, "Could not delete original file after move.");
-                }
+                _targetFilePath = destPath;
+                RememberMovedFile(sourcePath, destPath);
+                UpdateInfoDisplay();
             }
 
             _lblStatus.Text = $"{(isMove ? "Moved" : "Copied")} to {destPath}";

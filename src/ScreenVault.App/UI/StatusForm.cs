@@ -332,7 +332,7 @@ public sealed class StatusForm : ModernForm
         {
             if (Visible)
             {
-                _audioEngine.SetMonitoring(true);
+                _audioEngine.SetMonitoring(this, true);
                 UpdateToolTips();
                 Refresh1Hz();
                 _timer10Hz.Start();
@@ -340,7 +340,7 @@ public sealed class StatusForm : ModernForm
             }
             else
             {
-                _audioEngine.SetMonitoring(false);
+                _audioEngine.SetMonitoring(this, false);
                 _timer10Hz.Stop();
                 _timer1Hz.Stop();
             }
@@ -626,16 +626,17 @@ public sealed class StatusForm : ModernForm
                 _btnTestAudio.Enabled = false;
                 break;
 
-            case RecorderState.Faulted:
-                SetPill("Not recording — retrying", Tone.Danger);
-                SetMainButton("Retry start", ButtonKind.Record, Glyphs.Refresh, enabled: true);
-                SetPauseButton(paused: false, enabled: false);
-                _btnTestAudio.Enabled = !_isTestingAudio;
+            case RecorderState.Faulted when health.Desired != DesiredState.Stopped:
+                // ScreenVault keeps retrying on its own; the user must still be able to give up.
+                SetPill(health.Desired == DesiredState.Paused ? "Paused" : "Not recording — retrying", health.Desired == DesiredState.Paused ? Tone.Warning : Tone.Danger);
+                SetMainButton("Stop", ButtonKind.Strong, Glyphs.Stop, enabled: true);
+                SetPauseButton(paused: health.Desired == DesiredState.Paused, enabled: health.Desired == DesiredState.Paused);
+                _btnTestAudio.Enabled = false;
                 break;
 
             case RecorderState.Starting:
                 SetPill("Starting…", Tone.Accent);
-                SetMainButton("Starting…", ButtonKind.Record, Glyphs.Record, enabled: false);
+                SetMainButton("Stop", ButtonKind.Strong, Glyphs.Stop, enabled: true);
                 SetPauseButton(paused: false, enabled: false);
                 _btnTestAudio.Enabled = false;
                 break;
@@ -650,7 +651,7 @@ public sealed class StatusForm : ModernForm
 
             case RecorderState.Recovering:
                 SetPill("Recovering…", Tone.Warning);
-                SetMainButton("Recovering…", ButtonKind.Strong, Glyphs.Refresh, enabled: false);
+                SetMainButton("Stop", ButtonKind.Strong, Glyphs.Stop, enabled: true);
                 SetPauseButton(paused: false, enabled: false);
                 _btnTestAudio.Enabled = false;
                 break;
@@ -732,8 +733,8 @@ public sealed class StatusForm : ModernForm
         var rows = new List<StorageMeterRow>(status.Locations.Count);
         foreach (var location in status.Locations)
         {
-            var isActive = string.Equals(location.Path, status.ActiveLocationPath, StringComparison.OrdinalIgnoreCase);
-            var expanded = Environment.ExpandEnvironmentVariables(location.Path);
+            var isActive = string.Equals(location.ExpandedPath, status.ActiveLocationPath, StringComparison.OrdinalIgnoreCase);
+            var expanded = location.ExpandedPath;
             var (stateText, tone) = location.State switch
             {
                 StorageLocationState.Low => ("Low on space", Tone.Warning),
@@ -790,30 +791,62 @@ public sealed class StatusForm : ModernForm
 
     private async Task OnMainButtonClickedAsync()
     {
-        if (_controller.State is RecorderState.Recording or RecorderState.Paused)
+        _btnMain.Enabled = false;
+        try
         {
-            if (!RecordingPrompts.ConfirmStop(this, _settingsService))
+            if (_controller.Desired != DesiredState.Stopped)
             {
-                return;
-            }
+                // Only ask when something is actually being recorded.
+                if (_controller.State is RecorderState.Recording or RecorderState.Paused &&
+                    !RecordingPrompts.ConfirmStop(this, _settingsService))
+                {
+                    return;
+                }
 
-            await _controller.StopAsync().ConfigureAwait(true);
+                await _controller.StopAsync().ConfigureAwait(true);
+            }
+            else if (_controller.State is RecorderState.Idle or RecorderState.Faulted)
+            {
+                await _controller.StartAsync().ConfigureAwait(true);
+            }
         }
-        else if (_controller.State is RecorderState.Idle or RecorderState.Faulted)
+        catch (Exception ex)
         {
-            await _controller.StartAsync().ConfigureAwait(true);
+            Log.Error(ex, "Start/stop from the status window failed.");
+        }
+        finally
+        {
+            if (!IsDisposed)
+            {
+                Refresh1Hz();
+            }
         }
     }
 
     private async Task TogglePauseAsync()
     {
-        if (_controller.State == RecorderState.Recording)
+        _btnPauseResume.Enabled = false;
+        try
         {
-            await _controller.PauseAsync().ConfigureAwait(true);
+            if (_controller.Desired == DesiredState.Recording)
+            {
+                await _controller.PauseAsync().ConfigureAwait(true);
+            }
+            else if (_controller.Desired == DesiredState.Paused)
+            {
+                await _controller.ResumeAsync().ConfigureAwait(true);
+            }
         }
-        else if (_controller.State == RecorderState.Paused)
+        catch (Exception ex)
         {
-            await _controller.ResumeAsync().ConfigureAwait(true);
+            Log.Error(ex, "Pause/resume from the status window failed.");
+        }
+        finally
+        {
+            if (!IsDisposed)
+            {
+                Refresh1Hz();
+            }
         }
     }
 
@@ -830,16 +863,26 @@ public sealed class StatusForm : ModernForm
     private void RevealCurrentFile()
     {
         var path = _controller.Health.CurrentFilePath;
-        if (!string.IsNullOrEmpty(path) && File.Exists(path))
+        if (string.IsNullOrEmpty(path) || !File.Exists(path))
         {
-            Process.Start("explorer.exe", $"/select,\"{path}\"");
-            return;
+            path = GetLastSavedFilePath();
         }
 
-        var saved = GetLastSavedFilePath();
-        if (!string.IsNullOrEmpty(saved) && File.Exists(saved))
+        if (!string.IsNullOrEmpty(path) && File.Exists(path))
         {
-            Process.Start("explorer.exe", $"/select,\"{saved}\"");
+            StartExplorer($"/select,\"{path}\"");
+        }
+    }
+
+    private static void StartExplorer(string arguments)
+    {
+        try
+        {
+            Process.Start("explorer.exe", arguments);
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            Log.Warning(ex, "Could not open Explorer.");
         }
     }
 
@@ -930,12 +973,20 @@ public sealed class StatusForm : ModernForm
             dir = Environment.ExpandEnvironmentVariables(primary);
         }
 
-        if (!Directory.Exists(dir))
+        try
         {
-            Directory.CreateDirectory(dir);
+            if (!Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            ModernDialog.Warning(this, "Can't open the recordings folder", $"{dir}\n\n{ex.Message}");
+            return;
         }
 
-        Process.Start("explorer.exe", $"\"{dir}\"");
+        StartExplorer($"\"{dir}\"");
     }
 
     private async Task RunAudioTestAsync()
@@ -944,13 +995,35 @@ public sealed class StatusForm : ModernForm
         _btnTestAudio.Enabled = false;
         _btnTestAudio.Text = "Listening… 5s";
 
+        MMDeviceEnumerator? enumerator = null;
+        MMDevice? device = null;
         try
         {
-            var memoryStream = new MemoryStream();
-            using var capture = new WasapiCapture();
+            // Test the microphone that recordings actually use (the settings pick communications or
+            // multimedia default, which is often not the device WasapiCapture would pick by itself).
+            var audioSettings = _settingsService.Current.Audio;
+            if (audioSettings.MicMode == MicMode.None)
+            {
+                ModernDialog.Info(this, "The microphone is turned off", "Recording the microphone is disabled in Settings → Audio.");
+                return;
+            }
+
+            enumerator = new MMDeviceEnumerator();
+            var endpoint = EndpointResolver.Resolve(enumerator, audioSettings).DesiredEndpoints.FirstOrDefault(e => !e.IsLoopback);
+            if (endpoint == null)
+            {
+                ModernDialog.Warning(this, "No microphone found", "Connect a microphone or headset, then check the input device in Windows Sound settings.");
+                return;
+            }
+
+            device = enumerator.GetDevice(endpoint.Id);
+            using var memoryStream = new MemoryStream();
+            using var capture = new WasapiCapture(device);
             var maxPeakSeen = -90f;
             var isFloat = capture.WaveFormat.Encoding == WaveFormatEncoding.IeeeFloat ||
                           capture.WaveFormat.BitsPerSample == 32;
+            var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            capture.RecordingStopped += (_, _) => stopped.TrySetResult();
 
             capture.DataAvailable += (_, args) =>
             {
@@ -975,6 +1048,9 @@ public sealed class StatusForm : ModernForm
             await Task.Delay(5000);
             capture.StopRecording();
 
+            // Capture stops asynchronously: wait until the last buffer has been written.
+            await Task.WhenAny(stopped.Task, Task.Delay(2000));
+
             _btnTestAudio.Text = "Playing back…";
             memoryStream.Position = 0;
             if (memoryStream.Length > 0)
@@ -989,27 +1065,40 @@ public sealed class StatusForm : ModernForm
                 }
             }
 
+            if (IsDisposed)
+            {
+                return;
+            }
+
             if (maxPeakSeen < -50f)
             {
                 ModernDialog.Warning(this,
                     "Your microphone seems silent",
-                    "The level never rose above −50 dB. Check the mute switch on your headset, the input device in Windows Sound settings, and Settings → Privacy → Microphone.");
+                    $"The level of \"{endpoint.Name}\" never rose above −50 dB. Check the mute switch on your headset, the input device in Windows Sound settings, and Settings → Privacy → Microphone.");
             }
             else
             {
-                ModernDialog.Success(this, "Microphone works", "ScreenVault heard you clearly. You're ready to record.");
+                ModernDialog.Success(this, "Microphone works", $"ScreenVault heard you clearly on \"{endpoint.Name}\". You're ready to record.");
             }
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "Audio test failed.");
-            ModernDialog.Error(this, "Audio test failed", ex.Message);
+            if (!IsDisposed)
+            {
+                ModernDialog.Error(this, "Audio test failed", ex.Message);
+            }
         }
         finally
         {
+            device?.Dispose();
+            enumerator?.Dispose();
             _isTestingAudio = false;
-            _btnTestAudio.Text = "Test audio";
-            _btnTestAudio.Enabled = true;
+            if (!IsDisposed)
+            {
+                _btnTestAudio.Text = "Test audio";
+                _btnTestAudio.Enabled = _controller.State is RecorderState.Idle;
+            }
         }
     }
 }
