@@ -28,8 +28,15 @@ public sealed class SettingsForm : ModernForm
     // automatically) is added as an extra entry so saving never silently changes it.
     private readonly List<int> _frameRateValues = [15, 24, 30];
     private readonly List<int> _splitMinuteValues = [5, 10, 15, 30, 60];
-    private readonly List<MicMode> _micModeValues = [MicMode.DefaultCommunications, MicMode.DefaultMultimedia, MicMode.None];
-    private readonly List<OutputMode> _outputModeValues = [OutputMode.DefaultPlusCommunications, OutputMode.Default, OutputMode.None];
+    private readonly List<MicMode> _micModeValues = [MicMode.DefaultCommunications, MicMode.DefaultMultimedia, MicMode.Specific, MicMode.None];
+    private readonly List<OutputMode> _outputModeValues = [OutputMode.DefaultPlusCommunications, OutputMode.Default, OutputMode.Specific, OutputMode.None];
+
+    // Populated once from Windows: which physical monitor and, when a specific device is chosen,
+    // which audio endpoint each device row's index maps to. A device unplugged since it was chosen
+    // is still added as an extra entry (see SelectValue) so saving never silently changes it.
+    private readonly List<int> _monitorIndexValues = [];
+    private readonly List<string?> _micDeviceIds = [];
+    private readonly List<string?> _outputDeviceIds = [];
 
     // General
     private readonly ToggleSwitch _chkStartWithWindows = new();
@@ -44,6 +51,7 @@ public sealed class SettingsForm : ModernForm
     private readonly ToggleSwitch _chkPromptStopMeeting = new();
 
     // Video
+    private readonly ModernComboBox _cmbMonitor = new();
     private readonly ModernComboBox _cmbFrameRate = new();
     private readonly ModernComboBox _cmbQuality = new();
     private readonly ModernComboBox _cmbEncoder = new();
@@ -55,7 +63,11 @@ public sealed class SettingsForm : ModernForm
 
     // Audio
     private readonly ModernComboBox _cmbMicMode = new();
+    private readonly ModernComboBox _cmbMicDevice = new();
     private readonly ModernComboBox _cmbOutputMode = new();
+    private readonly ModernComboBox _cmbOutputDevice = new();
+    private SettingRow _micDeviceRow = null!;
+    private SettingRow _outputDeviceRow = null!;
     private readonly ModernSlider _trkMicGain = new() { Minimum = -20, Maximum = 20, Origin = 0 };
     private readonly TextLabel _lblMicGainVal = new("0 dB", Typography.BodyStrong);
     private readonly ModernSlider _trkSysGain = new() { Minimum = -20, Maximum = 20, Origin = 0 };
@@ -114,15 +126,20 @@ public sealed class SettingsForm : ModernForm
         _cmbFrameRate.Items.AddRange(["15 fps (recommended)", "24 fps", "30 fps"]);
         _cmbQuality.Items.AddRange(["Small — lowest CPU and size", "Balanced (recommended)", "High — crisp small text"]);
         _cmbEncoder.Items.AddRange(["Auto", "nvenc-d3d11", "amf-d3d11", "qsv-hwmap", "nvenc-sysmem", "amf-sysmem", "qsv-sysmem", "x264"]);
-        _cmbMicMode.Items.AddRange(["Windows default – communications (recommended)", "Windows default – multimedia", "Don't record the microphone"]);
-        _cmbOutputMode.Items.AddRange(["Default + communications (recommended)", "Default output only", "Don't record system audio"]);
+        _cmbMicMode.Items.AddRange(["Windows default – communications (recommended)", "Windows default – multimedia", "A specific microphone…", "Don't record the microphone"]);
+        _cmbOutputMode.Items.AddRange(["Default + communications (recommended)", "Default output only", "A specific output device…", "Don't record system audio"]);
         _cmbSplitMinutes.Items.AddRange(["5 minutes", "10 minutes (recommended)", "15 minutes", "30 minutes", "60 minutes"]);
         _cmbOutputFormat.Items.AddRange(["MKV (recommended)", "MP4 (most compatible)", "TS (raw live format)"]);
         _cmbLogLevel.Items.AddRange(["Debug", "Information", "Warning", "Error"]);
-        foreach (var combo in new[] { _cmbTheme, _cmbMeetingMode, _cmbFrameRate, _cmbQuality, _cmbEncoder, _cmbMicMode, _cmbOutputMode, _cmbSplitMinutes, _cmbOutputFormat, _cmbLogLevel })
+        foreach (var combo in new[] { _cmbTheme, _cmbMeetingMode, _cmbMonitor, _cmbFrameRate, _cmbQuality, _cmbEncoder, _cmbMicMode, _cmbMicDevice, _cmbOutputMode, _cmbOutputDevice, _cmbSplitMinutes, _cmbOutputFormat, _cmbLogLevel })
         {
             combo.Width = 260;
         }
+
+        PopulateMonitorList();
+        PopulateAudioDeviceLists();
+        _cmbMicMode.SelectedIndexChanged += (_, _) => UpdateAudioDeviceRowVisibility();
+        _cmbOutputMode.SelectedIndexChanged += (_, _) => UpdateAudioDeviceRowVisibility();
 
         _numStartupDelay.Width = 110;
         _numJitterBuffer.Width = 120;
@@ -163,6 +180,7 @@ public sealed class SettingsForm : ModernForm
         var video = CreatePage("Video", "Frame rate, quality and the encoder used to compress your screen.");
         video.Controls.Add(Section("Capture"));
         video.Controls.Add(Card(
+            Row("Monitor", "Which screen to record when you have more than one connected.", _cmbMonitor, Glyphs.Monitor),
             Row("Frame rate", "15 fps keeps files small and is smooth enough for screen sharing and slides.", _cmbFrameRate, Glyphs.Video),
             Row("Quality", "Higher quality keeps small text crisp but creates larger files.", _cmbQuality, Glyphs.Monitor),
             Row("Capture mouse cursor", "Show the pointer in recordings.", _chkCaptureCursor),
@@ -189,9 +207,13 @@ public sealed class SettingsForm : ModernForm
         // Audio
         var audio = CreatePage("Audio", "Which microphone and speakers are recorded, and how loud.");
         audio.Controls.Add(Section("Sources"));
+        _micDeviceRow = Row("Microphone device", "Only used while \"A specific microphone\" is selected above.", _cmbMicDevice, Glyphs.Microphone);
+        _outputDeviceRow = Row("Output device", "Only used while \"A specific output device\" is selected above.", _cmbOutputDevice, Glyphs.Volume);
         audio.Controls.Add(Card(
             Row("Microphone", "Follows the Windows default, so plugging in a headset just works.", _cmbMicMode, Glyphs.Microphone),
-            Row("System audio", "\"Default + communications\" also captures Teams or Zoom when they use a separate device.", _cmbOutputMode, Glyphs.Volume)));
+            _micDeviceRow,
+            Row("System audio", "\"Default + communications\" also captures Teams or Zoom when they use a separate device.", _cmbOutputMode, Glyphs.Volume),
+            _outputDeviceRow));
         audio.Controls.Add(Section("Levels"));
         _trkMicGain.ValueChanged += (_, _) => _lblMicGainVal.Text = FormatGain(_trkMicGain.Value);
         _trkSysGain.ValueChanged += (_, _) => _lblSysGainVal.Text = FormatGain(_trkSysGain.Value);
@@ -405,6 +427,91 @@ public sealed class SettingsForm : ModernForm
 
     private static SettingRow Row(string title, string? description, Control? control, char glyph = Glyphs.None) => new(title, description, control, glyph);
 
+    /// <summary>Lists the monitors Windows currently reports, in <see cref="Screen.AllScreens"/> order —
+    /// the same order FFmpeg's ddagrab source (<c>output_idx</c>) uses to number outputs.</summary>
+    private void PopulateMonitorList()
+    {
+        _cmbMonitor.Items.Clear();
+        _monitorIndexValues.Clear();
+
+        var screens = Screen.AllScreens;
+        for (var i = 0; i < screens.Length; i++)
+        {
+            var bounds = screens[i].Bounds;
+            var label = $"Monitor {i + 1} — {bounds.Width}×{bounds.Height}" + (screens[i].Primary ? " (Primary)" : string.Empty);
+            _cmbMonitor.Items.Add(label);
+            _monitorIndexValues.Add(i);
+        }
+
+        if (_monitorIndexValues.Count == 0)
+        {
+            // Design-time / no display attached: still offer the default so the combo isn't empty.
+            _cmbMonitor.Items.Add("Monitor 1 (Primary)");
+            _monitorIndexValues.Add(0);
+        }
+    }
+
+    private void PopulateAudioDeviceLists()
+    {
+        _cmbMicDevice.Items.Clear();
+        _micDeviceIds.Clear();
+        _cmbMicDevice.Items.Add("(no microphones found)");
+        _micDeviceIds.Add(null);
+        foreach (var device in ScreenVault.Core.Audio.AudioDeviceLister.ListCaptureDevices())
+        {
+            if (_micDeviceIds.Count == 1)
+            {
+                _cmbMicDevice.Items.Clear();
+                _micDeviceIds.Clear();
+            }
+
+            _cmbMicDevice.Items.Add(device.Name);
+            _micDeviceIds.Add(device.Id);
+        }
+
+        _cmbOutputDevice.Items.Clear();
+        _outputDeviceIds.Clear();
+        _cmbOutputDevice.Items.Add("(no output devices found)");
+        _outputDeviceIds.Add(null);
+        foreach (var device in ScreenVault.Core.Audio.AudioDeviceLister.ListRenderDevices())
+        {
+            if (_outputDeviceIds.Count == 1)
+            {
+                _cmbOutputDevice.Items.Clear();
+                _outputDeviceIds.Clear();
+            }
+
+            _cmbOutputDevice.Items.Add(device.Name);
+            _outputDeviceIds.Add(device.Id);
+        }
+    }
+
+    private void UpdateAudioDeviceRowVisibility()
+    {
+        _micDeviceRow.Visible = ValueAt(_micModeValues, _cmbMicMode.SelectedIndex, MicMode.DefaultCommunications) == MicMode.Specific;
+        _outputDeviceRow.Visible = ValueAt(_outputModeValues, _cmbOutputMode.SelectedIndex, OutputMode.DefaultPlusCommunications) == OutputMode.Specific;
+    }
+
+    /// <summary>Selects the device with <paramref name="deviceId"/>, adding it as an extra ("unavailable
+    /// now") entry when it isn't in the current, live device list — so saving never silently changes it.</summary>
+    private static int SelectDevice(ModernComboBox combo, List<string?> deviceIds, string? deviceId)
+    {
+        if (string.IsNullOrEmpty(deviceId))
+        {
+            return deviceIds.Count > 0 ? 0 : -1;
+        }
+
+        var index = deviceIds.FindIndex(id => string.Equals(id, deviceId, StringComparison.OrdinalIgnoreCase));
+        if (index < 0)
+        {
+            deviceIds.Add(deviceId);
+            combo.Items.Add("(previously chosen device — not connected)");
+            index = deviceIds.Count - 1;
+        }
+
+        return index;
+    }
+
     private static Panel GainEditor(ModernSlider slider, TextLabel valueLabel)
     {
         var panel = new Panel { Size = new Size(260, 32) };
@@ -535,6 +642,9 @@ public sealed class SettingsForm : ModernForm
         _chkPromptStopMeeting.Checked = _workingCopy.MeetingDetection.PromptStopWhenMeetingEnds;
 
         // Video
+        _cmbMonitor.SelectedIndex = SelectValue(_cmbMonitor, _monitorIndexValues, _workingCopy.Video.MonitorIndex,
+            idx => $"Monitor {idx + 1} (not currently connected)");
+
         _cmbFrameRate.SelectedIndex = SelectValue(_cmbFrameRate, _frameRateValues, _workingCopy.Video.FrameRate,
             fps => string.Create(CultureInfo.CurrentCulture, $"{fps} fps (current)"));
 
@@ -560,6 +670,9 @@ public sealed class SettingsForm : ModernForm
             _ => "A specific microphone (chosen earlier)");
         _cmbOutputMode.SelectedIndex = SelectValue(_cmbOutputMode, _outputModeValues, _workingCopy.Audio.OutputMode,
             mode => mode == OutputMode.AllActive ? "All playback devices" : "A specific output device (chosen earlier)");
+        _cmbMicDevice.SelectedIndex = SelectDevice(_cmbMicDevice, _micDeviceIds, _workingCopy.Audio.MicDeviceId);
+        _cmbOutputDevice.SelectedIndex = SelectDevice(_cmbOutputDevice, _outputDeviceIds, _workingCopy.Audio.OutputDeviceId);
+        UpdateAudioDeviceRowVisibility();
         _trkMicGain.Value = (int)Math.Clamp(_workingCopy.Audio.MicGainDb, -20, 20);
         _lblMicGainVal.Text = FormatGain(_trkMicGain.Value);
         _trkSysGain.Value = (int)Math.Clamp(_workingCopy.Audio.SystemGainDb, -20, 20);
@@ -682,6 +795,7 @@ public sealed class SettingsForm : ModernForm
         };
         _workingCopy.MeetingDetection.PromptStopWhenMeetingEnds = _chkPromptStopMeeting.Checked;
 
+        _workingCopy.Video.MonitorIndex = ValueAt(_monitorIndexValues, _cmbMonitor.SelectedIndex, 0);
         _workingCopy.Video.FrameRate = ValueAt(_frameRateValues, _cmbFrameRate.SelectedIndex, 15);
 
         _workingCopy.Video.Quality = _cmbQuality.SelectedIndex switch
@@ -697,6 +811,8 @@ public sealed class SettingsForm : ModernForm
 
         _workingCopy.Audio.MicMode = ValueAt(_micModeValues, _cmbMicMode.SelectedIndex, MicMode.DefaultCommunications);
         _workingCopy.Audio.OutputMode = ValueAt(_outputModeValues, _cmbOutputMode.SelectedIndex, OutputMode.DefaultPlusCommunications);
+        _workingCopy.Audio.MicDeviceId = ValueAt(_micDeviceIds, _cmbMicDevice.SelectedIndex, null);
+        _workingCopy.Audio.OutputDeviceId = ValueAt(_outputDeviceIds, _cmbOutputDevice.SelectedIndex, null);
 
         _workingCopy.Audio.MicGainDb = _trkMicGain.Value;
         _workingCopy.Audio.SystemGainDb = _trkSysGain.Value;
@@ -737,6 +853,16 @@ public sealed class SettingsForm : ModernForm
         if (!validationResult.IsValid)
         {
             errors.AddRange(validationResult.Errors);
+        }
+
+        if (_workingCopy.Audio.MicMode == MicMode.Specific && string.IsNullOrWhiteSpace(_workingCopy.Audio.MicDeviceId))
+        {
+            errors.Add("Choose a microphone, or switch back to a Windows default.");
+        }
+
+        if (_workingCopy.Audio.OutputMode == OutputMode.Specific && string.IsNullOrWhiteSpace(_workingCopy.Audio.OutputDeviceId))
+        {
+            errors.Add("Choose an output device, or switch back to a Windows default.");
         }
 
         var shortcuts = new[] { _workingCopy.Hotkeys.StartStop, _workingCopy.Hotkeys.MuteMic, _workingCopy.Hotkeys.AddMarker, _workingCopy.Hotkeys.PauseResume, _workingCopy.Hotkeys.ShowStatus };
