@@ -1,11 +1,9 @@
-using System.Diagnostics;
 using System.Globalization;
 using System.IO.Abstractions;
 using System.Text;
 using ScreenVault.Core.Ffmpeg;
 using ScreenVault.Core.Sessions;
 using ScreenVault.Core.Settings;
-using ScreenVault.Core.Storage;
 using Serilog;
 
 namespace ScreenVault.Core.PostProcessing;
@@ -73,11 +71,16 @@ public sealed class ClipExporter : IClipExporter
             _fileSystem.Directory.CreateDirectory(destDir);
         }
 
-        var locationRoot = StorageDirectoryHelper.GetLocationRoot(_fileSystem, fullDest);
-        var tempDir = StorageDirectoryHelper.GetTempDirectory(_fileSystem, locationRoot);
-        var partialFileName = _fileSystem.Path.GetFileName(fullDest) + ".partial";
-        var partialPath = _fileSystem.Path.Combine(tempDir, partialFileName);
-        var tempConcatFile = _fileSystem.Path.Combine(tempDir, $"clip_concat_{Guid.NewGuid():N}.txt");
+        // Work next to the destination (same drive, so the final rename is instant) instead of
+        // creating ScreenVault folders in whatever folder the user picked.
+        var partialPath = fullDest + ".partial";
+        var tempConcatFile = _fileSystem.Path.Combine(Path.GetTempPath(), $"sv_clip_concat_{Guid.NewGuid():N}.txt");
+        var containerFormat = options.Format switch
+        {
+            OutputContainerFormat.Mkv => "matroska",
+            OutputContainerFormat.Ts => "mpegts",
+            _ => "mp4"
+        };
 
         try
         {
@@ -89,59 +92,19 @@ public sealed class ClipExporter : IClipExporter
                 : null;
             if (!string.IsNullOrEmpty(fullMerged) && _fileSystem.File.Exists(fullMerged))
             {
-                var startInfo = new ProcessStartInfo
+                var args = new List<string>
                 {
-                    FileName = _ffmpegPath,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true
+                    "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                    "-ss", options.StartOffsetSec.ToString("F3", CultureInfo.InvariantCulture),
+                    "-to", options.EndOffsetSec.ToString("F3", CultureInfo.InvariantCulture),
+                    "-i", fullMerged
                 };
+                AddOutputArguments(args, options, containerFormat, partialPath);
 
-                startInfo.ArgumentList.Add("-hide_banner");
-                startInfo.ArgumentList.Add("-loglevel");
-                startInfo.ArgumentList.Add("error");
-                startInfo.ArgumentList.Add("-y");
-                startInfo.ArgumentList.Add("-ss");
-                startInfo.ArgumentList.Add(options.StartOffsetSec.ToString("F3", CultureInfo.InvariantCulture));
-                startInfo.ArgumentList.Add("-to");
-                startInfo.ArgumentList.Add(options.EndOffsetSec.ToString("F3", CultureInfo.InvariantCulture));
-                startInfo.ArgumentList.Add("-i");
-                startInfo.ArgumentList.Add(fullMerged);
-
-                if (options.PreciseReencode)
+                var (exitCode, stderr) = await FfmpegRunner.RunAsync(_ffmpegPath, args, ct: ct).ConfigureAwait(false);
+                if (exitCode != 0)
                 {
-                    startInfo.ArgumentList.Add("-c:v");
-                    startInfo.ArgumentList.Add("libx264");
-                    startInfo.ArgumentList.Add("-preset");
-                    startInfo.ArgumentList.Add("veryfast");
-                    startInfo.ArgumentList.Add("-crf");
-                    startInfo.ArgumentList.Add("23");
-                    startInfo.ArgumentList.Add("-c:a");
-                    startInfo.ArgumentList.Add("aac");
-                }
-                else
-                {
-                    startInfo.ArgumentList.Add("-c");
-                    startInfo.ArgumentList.Add("copy");
-                }
-
-                if (options.Format == OutputContainerFormat.Mp4)
-                {
-                    startInfo.ArgumentList.Add("-movflags");
-                    startInfo.ArgumentList.Add("+faststart");
-                }
-
-                startInfo.ArgumentList.Add(partialPath);
-
-                using var proc = new Process { StartInfo = startInfo };
-                proc.Start();
-                var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-                await proc.WaitForExitAsync(ct).ConfigureAwait(false);
-                var stderr = await stderrTask.ConfigureAwait(false);
-
-                if (proc.ExitCode != 0)
-                {
+                    DeleteQuietly(partialPath);
                     return new ClipExportResult(false, null, $"FFmpeg clip export failed: {stderr}");
                 }
             }
@@ -197,59 +160,13 @@ public sealed class ClipExporter : IClipExporter
 
                 await _fileSystem.File.WriteAllTextAsync(tempConcatFile, concatBuilder.ToString(), ct).ConfigureAwait(false);
 
-                var startInfo = new ProcessStartInfo
+                var args = new List<string> { "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", tempConcatFile };
+                AddOutputArguments(args, options, containerFormat, partialPath);
+
+                var (exitCode, stderr) = await FfmpegRunner.RunAsync(_ffmpegPath, args, ct: ct).ConfigureAwait(false);
+                if (exitCode != 0)
                 {
-                    FileName = _ffmpegPath,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true
-                };
-
-                startInfo.ArgumentList.Add("-hide_banner");
-                startInfo.ArgumentList.Add("-loglevel");
-                startInfo.ArgumentList.Add("error");
-                startInfo.ArgumentList.Add("-y");
-                startInfo.ArgumentList.Add("-f");
-                startInfo.ArgumentList.Add("concat");
-                startInfo.ArgumentList.Add("-safe");
-                startInfo.ArgumentList.Add("0");
-                startInfo.ArgumentList.Add("-i");
-                startInfo.ArgumentList.Add(tempConcatFile);
-
-                if (options.PreciseReencode)
-                {
-                    startInfo.ArgumentList.Add("-c:v");
-                    startInfo.ArgumentList.Add("libx264");
-                    startInfo.ArgumentList.Add("-preset");
-                    startInfo.ArgumentList.Add("veryfast");
-                    startInfo.ArgumentList.Add("-crf");
-                    startInfo.ArgumentList.Add("23");
-                    startInfo.ArgumentList.Add("-c:a");
-                    startInfo.ArgumentList.Add("aac");
-                }
-                else
-                {
-                    startInfo.ArgumentList.Add("-c");
-                    startInfo.ArgumentList.Add("copy");
-                }
-
-                if (options.Format == OutputContainerFormat.Mp4)
-                {
-                    startInfo.ArgumentList.Add("-movflags");
-                    startInfo.ArgumentList.Add("+faststart");
-                }
-
-                startInfo.ArgumentList.Add(partialPath);
-
-                using var proc = new Process { StartInfo = startInfo };
-                proc.Start();
-                var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-                await proc.WaitForExitAsync(ct).ConfigureAwait(false);
-                var stderr = await stderrTask.ConfigureAwait(false);
-
-                if (proc.ExitCode != 0)
-                {
+                    DeleteQuietly(partialPath);
                     return new ClipExportResult(false, null, $"FFmpeg clip export failed: {stderr}");
                 }
             }
@@ -266,21 +183,56 @@ public sealed class ClipExporter : IClipExporter
             Log.Information("Clip successfully exported to {Path}", fullDest);
             return new ClipExportResult(true, fullDest, null);
         }
+        catch (OperationCanceledException)
+        {
+            Log.Information("Clip export for session {SessionId} was cancelled.", options.SessionId);
+            DeleteQuietly(partialPath);
+            return new ClipExportResult(false, null, "Export cancelled.");
+        }
         catch (Exception ex)
         {
             Log.Error(ex, "Error exporting clip for session {SessionId}", options.SessionId);
-            if (_fileSystem.File.Exists(partialPath))
-            {
-                try { _fileSystem.File.Delete(partialPath); } catch { }
-            }
+            DeleteQuietly(partialPath);
             return new ClipExportResult(false, null, ex.Message);
         }
         finally
         {
-            if (_fileSystem.File.Exists(tempConcatFile))
+            DeleteQuietly(tempConcatFile);
+        }
+    }
+
+    private static void AddOutputArguments(List<string> args, ClipExportOptions options, string containerFormat, string outputPath)
+    {
+        if (options.PreciseReencode)
+        {
+            args.AddRange(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac"]);
+        }
+        else
+        {
+            args.AddRange(["-c", "copy"]);
+        }
+
+        if (options.Format == OutputContainerFormat.Mp4)
+        {
+            args.AddRange(["-movflags", "+faststart"]);
+        }
+
+        // The temporary file ends in ".partial", so FFmpeg cannot guess the container from it.
+        args.AddRange(["-f", containerFormat, outputPath]);
+    }
+
+    private void DeleteQuietly(string path)
+    {
+        try
+        {
+            if (_fileSystem.File.Exists(path))
             {
-                try { _fileSystem.File.Delete(tempConcatFile); } catch { }
+                _fileSystem.File.Delete(path);
             }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Log.Debug(ex, "Could not delete temporary file {Path}", path);
         }
     }
 }

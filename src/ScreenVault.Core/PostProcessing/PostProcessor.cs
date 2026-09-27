@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO.Abstractions;
-using System.Text;
 using System.Threading.Channels;
 using ScreenVault.Core.Ffmpeg;
 using ScreenVault.Core.Sessions;
@@ -108,6 +107,15 @@ public sealed class PostProcessor : IPostProcessor
     {
         if (!_fileSystem.File.Exists(job.TsPath))
         {
+            // A retry after the first attempt succeeded, or the file was moved/deleted meanwhile.
+            if (_fileSystem.File.Exists(job.FinalPath))
+            {
+                Log.Information("Remux source {TsPath} is gone but the final file exists; nothing to do.", job.TsPath);
+                UpdateManifestRemuxStatus(job, "Done");
+                NotifyCompleted(job, success: true);
+                return;
+            }
+
             Log.Warning("Remux source file does not exist: {TsPath}", job.TsPath);
             UpdateManifestRemuxStatus(job, "Failed");
             NotifyCompleted(job, success: false, errorMessage: "Source file not found");
@@ -117,7 +125,8 @@ public sealed class PostProcessor : IPostProcessor
         if (job.OutputFormat == OutputContainerFormat.Ts)
         {
             Log.Information("Format is TS; no remux needed for {TsPath}", job.TsPath);
-            UpdateManifestRemuxStatus(job, "NotRequired");
+            var tsDuration = (await _ffprobeClient.ProbeAsync(job.TsPath, ct).ConfigureAwait(false))?.DurationSeconds;
+            UpdateManifestRemuxStatus(job, "NotRequired", tsDuration);
             NotifyCompleted(job, success: true);
             return;
         }
@@ -148,67 +157,40 @@ public sealed class PostProcessor : IPostProcessor
                     chapterPath);
             }
 
-            // 2. Build FFmpeg command
-            var sb = new StringBuilder();
-            sb.Append(CultureInfo.InvariantCulture, $"-hide_banner -loglevel error -y -i \"{job.TsPath}\" ");
-            if (!string.IsNullOrEmpty(chapterFile) && _fileSystem.File.Exists(chapterFile))
-            {
-                sb.Append(CultureInfo.InvariantCulture, $"-i \"{chapterFile}\" -map 0 -map_chapters 1 ");
-            }
-            else
-            {
-                sb.Append("-map 0 ");
-            }
-
-            sb.Append("-c copy -bsf:a aac_adtstoasc ");
-
+            // 2. Build FFmpeg command (argument list: no quoting problems with paths or titles)
             var title = !string.IsNullOrWhiteSpace(job.SessionTitle)
                 ? job.SessionTitle
                 : $"ScreenVault session {job.SessionId}";
-            sb.Append(CultureInfo.InvariantCulture, $"-metadata title=\"{title}\" ");
-            sb.Append(CultureInfo.InvariantCulture, $"-metadata comment=\"ScreenVault session {job.SessionId}\" ");
-            sb.Append(CultureInfo.InvariantCulture, $"-metadata creation_time=\"{job.SegmentStartUtc:yyyy-MM-ddTHH:mm:ssZ}\" ");
 
-            if (job.OutputFormat == OutputContainerFormat.Mp4)
+            var args = new List<string> { "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", job.TsPath };
+            if (!string.IsNullOrEmpty(chapterFile) && _fileSystem.File.Exists(chapterFile))
             {
-                sb.Append(CultureInfo.InvariantCulture, $"-movflags +faststart -f mp4 \"{partialPath}\"");
+                args.AddRange(["-i", chapterFile, "-map", "0", "-map_chapters", "1"]);
             }
             else
             {
-                sb.Append(CultureInfo.InvariantCulture, $"-f matroska \"{partialPath}\"");
+                args.AddRange(["-map", "0"]);
+            }
+
+            args.AddRange(["-c", "copy", "-bsf:a", "aac_adtstoasc"]);
+            args.AddRange(["-metadata", $"title={title}"]);
+            args.AddRange(["-metadata", $"comment=ScreenVault session {job.SessionId}"]);
+            args.AddRange(["-metadata", string.Create(CultureInfo.InvariantCulture, $"creation_time={job.SegmentStartUtc:yyyy-MM-ddTHH:mm:ssZ}")]);
+
+            if (job.OutputFormat == OutputContainerFormat.Mp4)
+            {
+                args.AddRange(["-movflags", "+faststart", "-f", "mp4", partialPath]);
+            }
+            else
+            {
+                args.AddRange(["-f", "matroska", partialPath]);
             }
 
             // 3. Run FFmpeg at BelowNormal priority
-            var startInfo = new ProcessStartInfo
+            var (exitCode, stderr) = await FfmpegRunner.RunAsync(_ffmpegPath, args, ProcessPriorityClass.BelowNormal, ct).ConfigureAwait(false);
+            if (exitCode != 0)
             {
-                FileName = _ffmpegPath,
-                Arguments = sb.ToString(),
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using (var process = new Process { StartInfo = startInfo })
-            {
-                process.Start();
-                try
-                {
-                    process.PriorityClass = ProcessPriorityClass.BelowNormal;
-                }
-                catch
-                {
-                    // Ignore if permission denied on setting priority
-                }
-
-                var stderrTask = process.StandardError.ReadToEndAsync(ct);
-                await process.WaitForExitAsync(ct).ConfigureAwait(false);
-                var stderr = await stderrTask.ConfigureAwait(false);
-
-                if (process.ExitCode != 0)
-                {
-                    throw new InvalidOperationException($"FFmpeg remux failed with code {process.ExitCode}: {stderr}");
-                }
+                throw new InvalidOperationException($"FFmpeg remux failed with code {exitCode}: {stderr}");
             }
 
             // 4. Probe & Verify with ffprobe
@@ -244,7 +226,7 @@ public sealed class PostProcessor : IPostProcessor
                 }
             }
 
-            UpdateManifestRemuxStatus(job, "Done");
+            UpdateManifestRemuxStatus(job, "Done", remuxProbe.DurationSeconds);
             Log.Information("Successfully remuxed {TsPath} to {FinalPath}", job.TsPath, job.FinalPath);
             NotifyCompleted(job, success: true);
         }
@@ -302,7 +284,7 @@ public sealed class PostProcessor : IPostProcessor
         }
     }
 
-    private void UpdateManifestRemuxStatus(RemuxJob job, string status)
+    private void UpdateManifestRemuxStatus(RemuxJob job, string status, double? durationSec = null)
     {
         if (string.IsNullOrEmpty(job.SessionId))
         {
@@ -311,20 +293,61 @@ public sealed class PostProcessor : IPostProcessor
 
         try
         {
-            var manifest = _sessionStore.Load(job.SessionId);
-            if (manifest != null)
+            // Atomic update: while the session is still being recorded this edits the recorder's own
+            // copy, so the result is not overwritten by the recorder's next save.
+            _sessionStore.Update(job.SessionId, manifest =>
             {
                 var segment = manifest.Segments.FirstOrDefault(s => s.Index == job.SegmentIndex);
-                if (segment != null)
+                if (segment == null)
                 {
-                    segment.Remux = status;
-                    _sessionStore.Save(manifest);
+                    return false;
                 }
-            }
+
+                segment.Remux = status;
+                if (durationSec is > 0)
+                {
+                    segment.DurationSec = Math.Round(durationSec.Value, 2);
+                }
+
+                return true;
+            });
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "Failed to update manifest status for session {SessionId}", job.SessionId);
+        }
+    }
+
+    private string? ResolveSegmentPath(SegmentManifestEntry segment, string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        if (_fileSystem.Path.IsPathRooted(path))
+        {
+            return path;
+        }
+
+        var location = Environment.ExpandEnvironmentVariables(segment.Location);
+        return string.IsNullOrWhiteSpace(location) ? null : _fileSystem.Path.GetFullPath(_fileSystem.Path.Combine(location, path));
+    }
+
+    private void DeleteQuietly(string? path, string keep)
+    {
+        if (string.IsNullOrEmpty(path) || string.Equals(path, keep, StringComparison.OrdinalIgnoreCase) || !_fileSystem.File.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            _fileSystem.File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Could not delete merged part {Path}", path);
         }
     }
 
@@ -358,35 +381,31 @@ public sealed class PostProcessor : IPostProcessor
                 var mergeResult = await merger.MergeSessionAsync(sessionId, ct: ct).ConfigureAwait(false);
                 if (mergeResult.Success && !string.IsNullOrEmpty(mergeResult.MergedFilePath))
                 {
-                    manifest.MergedPath = mergeResult.MergedFilePath;
-                    manifest.MergeStatus = "Done";
-
                     if (savingSettings.DeletePartsAfterMerge)
                     {
+                        // Segment paths are stored relative to their storage location.
                         foreach (var seg in manifest.Segments)
                         {
-                            var final = seg.FinalPath;
-                            if (!string.IsNullOrEmpty(final) && _fileSystem.File.Exists(final))
-                            {
-                                try { _fileSystem.File.Delete(final); } catch { }
-                            }
-                            var ts = seg.TsPath;
-                            if (!string.IsNullOrEmpty(ts) && _fileSystem.File.Exists(ts))
-                            {
-                                try { _fileSystem.File.Delete(ts); } catch { }
-                            }
+                            DeleteQuietly(ResolveSegmentPath(seg, seg.FinalPath), mergeResult.MergedFilePath);
+                            DeleteQuietly(ResolveSegmentPath(seg, seg.TsPath), mergeResult.MergedFilePath);
                         }
                     }
 
-                    _sessionStore.Save(manifest);
+                    _sessionStore.Update(sessionId, m =>
+                    {
+                        m.MergedPath = mergeResult.MergedFilePath;
+                        m.MergeStatus = "Done";
+                        return true;
+                    });
                     return mergeResult;
                 }
-                else
+
+                _sessionStore.Update(sessionId, m =>
                 {
-                    manifest.MergeStatus = "Failed";
-                    _sessionStore.Save(manifest);
-                    return mergeResult;
-                }
+                    m.MergeStatus = "Failed";
+                    return true;
+                });
+                return mergeResult;
             }
         }
 

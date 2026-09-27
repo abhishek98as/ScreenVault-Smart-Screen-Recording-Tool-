@@ -26,6 +26,7 @@ public sealed class SegmentWriter : ISegmentSink, IDisposable
     private DateTime _sessionStartLocal;
     private DateTime _segmentStartLocal;
     private DateTime _segmentStartUtc;
+    private long _segmentStartTimestamp;
     private long _segmentBytesWritten;
     private long _lastFlushTimestamp;
     private int _flushCount;
@@ -37,8 +38,11 @@ public sealed class SegmentWriter : ISegmentSink, IDisposable
     private long _rotationRequestedTimestamp;
     private bool _streamActive;
 
+    private TimeSpan? _splitAfter;
+    private long? _splitAtBytes;
+
     public SegmentInfo? Current { get; private set; }
-    public long BytesWritten => _segmentBytesWritten;
+    public long BytesWritten => Interlocked.Read(ref _segmentBytesWritten);
     public event EventHandler<SegmentInfo>? SegmentClosed;
 
     public SegmentWriter(
@@ -55,10 +59,26 @@ public sealed class SegmentWriter : ISegmentSink, IDisposable
         _clock = clock ?? SystemClock.Instance;
     }
 
+    public void ConfigureSplitting(TimeSpan? maxDuration, long? maxBytes)
+    {
+        lock (_lock)
+        {
+            _splitAfter = maxDuration is { } d && d > TimeSpan.Zero ? d : null;
+            _splitAtBytes = maxBytes is > 0 ? maxBytes : null;
+        }
+    }
+
     public void BeginStream(DateTime? sessionStartLocal = null, int initialPartIndex = 1)
     {
         lock (_lock)
         {
+            if (_currentStream != null)
+            {
+                // A previous stream was never ended (e.g. a failed start): close it properly first.
+                Log.Warning("SegmentWriter: previous stream was still open; closing it before starting a new one.");
+                CloseCurrentSegment(RotationReason.Manual);
+            }
+
             _streamActive = true;
             _partIndex = initialPartIndex;
             _sessionStartLocal = sessionStartLocal ?? DateTime.Now;
@@ -66,6 +86,12 @@ public sealed class SegmentWriter : ISegmentSink, IDisposable
             _aligner.Reset();
             _psiCache.Reset();
             _unflushedTail.SetLength(0);
+
+            // Counters describe the new stream only; stale values from the previous recording would
+            // make the recorder believe data had already reached the disk.
+            Interlocked.Exchange(ref _segmentBytesWritten, 0);
+            Current = null;
+
             _currentOpenReason = initialPartIndex > 1 ? RotationReason.Manual : RotationReason.SessionStart;
             Log.Information("SegmentWriter: stream begun for session {SessionId}, starting at part {Part}",
                 SegmentNaming.FormatSessionId(_sessionStartLocal), _partIndex);
@@ -127,13 +153,34 @@ public sealed class SegmentWriter : ISegmentSink, IDisposable
         {
             FlushDurable();
         }
+
+        CheckSplitLimits();
+    }
+
+    private void CheckSplitLimits()
+    {
+        if (_rotationRequested || _currentStream == null)
+        {
+            return;
+        }
+
+        if (_splitAfter is { } maxDuration &&
+            _clock.SecondsBetween(_segmentStartTimestamp, _clock.Timestamp) >= maxDuration.TotalSeconds)
+        {
+            RequestRotationLocked(RotationReason.TimeSplit);
+        }
+        else if (_splitAtBytes is { } maxBytes && _segmentBytesWritten >= maxBytes)
+        {
+            RequestRotationLocked(RotationReason.SizeSplit);
+        }
     }
 
     private void OpenNewSegment()
     {
         _segmentStartLocal = DateTime.Now;
         _segmentStartUtc = _clock.UtcNow;
-        _segmentBytesWritten = 0;
+        _segmentStartTimestamp = _clock.Timestamp;
+        Interlocked.Exchange(ref _segmentBytesWritten, 0);
         var rawLocation = _locationSelector(150 * 1024 * 1024); // default 150 MB estimate
         _currentLocation = Environment.ExpandEnvironmentVariables(rawLocation);
         if (!_fileSystem.Path.IsPathRooted(_currentLocation))
@@ -197,13 +244,17 @@ public sealed class SegmentWriter : ISegmentSink, IDisposable
         if (_currentStream == null) return;
 
         _currentStream.Write(bytes);
-        _segmentBytesWritten += bytes.Length;
+        Interlocked.Add(ref _segmentBytesWritten, bytes.Length);
         _unflushedTail.Write(bytes);
     }
 
     private void HandleWriteFailure(Exception ex, ReadOnlySpan<byte> failedPacket)
     {
         _onWriteFailure?.Invoke(_currentLocation, ex);
+
+        // Everything written since the last durable flush may never have reached the failed drive.
+        // Keep a copy now: opening the next segment resets the tail buffer.
+        var tail = _unflushedTail.ToArray();
 
         // Close failing stream if possible
         try
@@ -216,17 +267,22 @@ public sealed class SegmentWriter : ISegmentSink, IDisposable
         }
         _currentStream = null;
 
+        // Whatever did reach the failed drive is still part of the recording: keep it in the session.
+        if (_segmentBytesWritten > 0)
+        {
+            RaiseSegmentClosed(RotationReason.StorageSwitch);
+        }
+
         // Select new location and open new segment
         _partIndex++;
         _currentOpenReason = RotationReason.StorageSwitch;
         OpenNewSegment();
 
         // Write unflushed tail to new segment to prevent data loss
-        if (_unflushedTail.Length > 0)
+        if (tail.Length > 0)
         {
-            var tailBytes = _unflushedTail.ToArray();
-            Log.Information("Writing {Count} bytes of unflushed tail to new storage location", tailBytes.Length);
-            WriteRawBytes(tailBytes);
+            Log.Information("Writing {Count} bytes of unflushed tail to new storage location", tail.Length);
+            WriteRawBytes(tail);
         }
 
         // Write the packet that triggered the error
@@ -274,31 +330,65 @@ public sealed class SegmentWriter : ISegmentSink, IDisposable
         lock (_lock)
         {
             if (!_streamActive) return;
-            _rotationRequested = true;
-            _pendingRotationReason = reason;
-            _rotationRequestedTimestamp = _clock.Timestamp;
-            Log.Information("Rotation requested. Reason: {Reason}", reason);
+            RequestRotationLocked(reason);
         }
+    }
+
+    private void RequestRotationLocked(RotationReason reason)
+    {
+        _rotationRequested = true;
+        _pendingRotationReason = reason;
+        _rotationRequestedTimestamp = _clock.Timestamp;
+        Log.Information("Rotation requested. Reason: {Reason}", reason);
     }
 
     private void RotateSegment(RotationReason closeReason)
     {
         _rotationRequested = false;
-        FlushDurable();
+        CloseCurrentSegment(closeReason);
 
-        if (_currentStream != null)
+        _partIndex++;
+        _currentOpenReason = closeReason;
+        OpenNewSegment();
+    }
+
+    public void EndStream()
+    {
+        lock (_lock)
         {
-            try
-            {
-                _currentStream.Dispose();
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "Error closing segment stream {Path}", _currentFilePath);
-            }
-            _currentStream = null;
+            if (!_streamActive) return;
+            _streamActive = false;
+            _rotationRequested = false;
+
+            CloseCurrentSegment(RotationReason.Manual);
+            Log.Information("SegmentWriter: stream ended cleanly.");
+        }
+    }
+
+    /// <summary>Flushes and closes the open segment (if any) and reports it as finished.</summary>
+    private void CloseCurrentSegment(RotationReason closeReason)
+    {
+        if (_currentStream == null)
+        {
+            return;
         }
 
+        FlushDurable();
+        try
+        {
+            _currentStream.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Error closing segment stream {Path}", _currentFilePath);
+        }
+
+        _currentStream = null;
+        RaiseSegmentClosed(closeReason);
+    }
+
+    private void RaiseSegmentClosed(RotationReason closeReason)
+    {
         var closedSegment = new SegmentInfo(
             _partIndex,
             _currentLocation,
@@ -315,52 +405,15 @@ public sealed class SegmentWriter : ISegmentSink, IDisposable
         Log.Information("Segment part {Part} closed. Bytes: {Bytes}, CloseReason: {Reason}",
             _partIndex, _segmentBytesWritten, closeReason);
 
-        _onSegmentClosed?.Invoke(closedSegment);
-        SegmentClosed?.Invoke(this, closedSegment);
-
-        _partIndex++;
-        _currentOpenReason = closeReason;
-        OpenNewSegment();
-    }
-
-    public void EndStream()
-    {
-        lock (_lock)
+        try
         {
-            if (!_streamActive) return;
-            _streamActive = false;
-
-            FlushDurable();
-            if (_currentStream != null)
-            {
-                try
-                {
-                    _currentStream.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    Log.Warning(ex, "Error closing final segment stream {Path}", _currentFilePath);
-                }
-                _currentStream = null;
-
-                var closedSegment = new SegmentInfo(
-                    _partIndex,
-                    _currentLocation,
-                    _currentFilePath,
-                    _fileSystem.Path.ChangeExtension(_currentFilePath, ".mkv"),
-                    _segmentStartUtc,
-                    _clock.UtcNow,
-                    _segmentBytesWritten,
-                    _currentOpenReason,
-                    RotationReason.Manual,
-                    "Pending");
-
-                Current = closedSegment;
-                _onSegmentClosed?.Invoke(closedSegment);
-                SegmentClosed?.Invoke(this, closedSegment);
-            }
-
-            Log.Information("SegmentWriter: stream ended cleanly.");
+            _onSegmentClosed?.Invoke(closedSegment);
+            SegmentClosed?.Invoke(this, closedSegment);
+        }
+        catch (Exception ex)
+        {
+            // Bookkeeping must never stop the recording itself.
+            Log.Error(ex, "Error while handling closed segment {Path}", _currentFilePath);
         }
     }
 

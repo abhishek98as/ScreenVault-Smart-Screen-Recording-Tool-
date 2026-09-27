@@ -118,6 +118,7 @@ public sealed class EncoderProbe
         };
 
         startInfo.ArgumentList.Add("-hide_banner");
+        startInfo.ArgumentList.Add("-nostdin");
         startInfo.ArgumentList.Add("-loglevel");
         startInfo.ArgumentList.Add("error");
         startInfo.ArgumentList.Add("-f");
@@ -138,6 +139,7 @@ public sealed class EncoderProbe
 
         var sw = Stopwatch.StartNew();
         var stderrLines = new List<string>();
+        Process? process = null;
 
         try
         {
@@ -145,7 +147,7 @@ public sealed class EncoderProbe
                 profile.Name,
                 string.Join(" ", startInfo.ArgumentList));
 
-            using var process = new Process { StartInfo = startInfo };
+            process = new Process { StartInfo = startInfo };
             process.ErrorDataReceived += (_, e) =>
             {
                 if (!string.IsNullOrWhiteSpace(e.Data))
@@ -190,19 +192,50 @@ public sealed class EncoderProbe
             Log.Information("Encoder probe '{Profile}' result: Success={Success}, Code={Code}, Duration={Duration:F2}s, Reason={Reason}",
                 profile.Name, success, process.ExitCode, sw.Elapsed.TotalSeconds, reason);
 
-            return new ProfileProbeStatus(profile.Name, success, process.ExitCode, reason, sw.Elapsed, stderrLines.ToArray());
+            return new ProfileProbeStatus(profile.Name, success, process.ExitCode, reason, sw.Elapsed, SnapshotLines(stderrLines));
         }
         catch (OperationCanceledException)
         {
             sw.Stop();
+            // A stuck test encoder would otherwise keep running (and holding the GPU) forever.
+            KillQuietly(process);
+            ct.ThrowIfCancellationRequested();
             Log.Warning("Encoder probe '{Profile}' timed out after 15s", profile.Name);
-            return new ProfileProbeStatus(profile.Name, false, -1, "Timed out (>15s)", sw.Elapsed, stderrLines.ToArray());
+            return new ProfileProbeStatus(profile.Name, false, -1, "Timed out (>15s)", sw.Elapsed, SnapshotLines(stderrLines));
         }
         catch (Exception ex)
         {
             sw.Stop();
+            KillQuietly(process);
             Log.Warning(ex, "Encoder probe for profile '{Profile}' failed with exception", profile.Name);
-            return new ProfileProbeStatus(profile.Name, false, -1, ex.Message, sw.Elapsed, stderrLines.ToArray());
+            return new ProfileProbeStatus(profile.Name, false, -1, ex.Message, sw.Elapsed, SnapshotLines(stderrLines));
+        }
+        finally
+        {
+            process?.Dispose();
+        }
+    }
+
+    private static string[] SnapshotLines(List<string> lines)
+    {
+        lock (lines)
+        {
+            return lines.ToArray();
+        }
+    }
+
+    private static void KillQuietly(Process? process)
+    {
+        try
+        {
+            if (process != null && !process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException)
+        {
+            Log.Debug(ex, "Could not stop the encoder test process.");
         }
     }
 }

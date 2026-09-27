@@ -12,6 +12,16 @@ public static class OrphanProcessKiller
             return 0;
         }
 
+        var expectedFullPath = SafeFullPath(expectedFfmpegPath);
+
+        // Anything started after this instance is ours (a recording or remux job that is running now).
+        // Only processes left over from a previous run are orphans.
+        DateTime appStartedLocal;
+        using (var self = Process.GetCurrentProcess())
+        {
+            appStartedLocal = self.StartTime;
+        }
+
         var killedCount = 0;
         try
         {
@@ -21,13 +31,20 @@ public static class OrphanProcessKiller
                 try
                 {
                     var exePath = process.MainModule?.FileName;
-                    if (string.Equals(exePath, expectedFfmpegPath, StringComparison.OrdinalIgnoreCase))
+                    if (!string.Equals(SafeFullPath(exePath), expectedFullPath, StringComparison.OrdinalIgnoreCase))
                     {
-                        Log.Warning("Killing orphan FFmpeg process {Pid} from previous session", process.Id);
-                        process.Kill(entireProcessTree: true);
-                        process.WaitForExit(1000);
-                        killedCount++;
+                        continue;
                     }
+
+                    if (process.StartTime >= appStartedLocal)
+                    {
+                        continue;
+                    }
+
+                    Log.Warning("Killing orphan FFmpeg process {Pid} from previous session", process.Id);
+                    process.Kill(entireProcessTree: true);
+                    process.WaitForExit(1000);
+                    killedCount++;
                 }
                 catch (Exception ex)
                 {
@@ -45,5 +62,22 @@ public static class OrphanProcessKiller
         }
 
         return killedCount;
+    }
+
+    private static string? SafeFullPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return path;
+        }
     }
 }

@@ -102,10 +102,9 @@ public sealed class RecoveryService : IRecoveryService
                     break;
                 }
 
-                if (manifest.Status == "Recording" || manifest.Status == "Stopping")
+                if ((manifest.Status == "Recording" || manifest.Status == "Stopping") && !_sessionStore.IsLive(manifest.SessionId))
                 {
                     hadInterrupted = true;
-                    manifest.Status = "Interrupted";
 
                     DateTime endedAt = manifest.StartedAtUtc;
                     if (manifest.Segments.Count > 0)
@@ -125,8 +124,12 @@ public sealed class RecoveryService : IRecoveryService
                         }
                     }
 
-                    manifest.EndedAtUtc = endedAt;
-                    _sessionStore.Save(manifest);
+                    _sessionStore.Update(manifest.SessionId, m =>
+                    {
+                        m.Status = "Interrupted";
+                        m.EndedAtUtc = endedAt;
+                        return true;
+                    });
 
                     var startLocal = manifest.StartedAtUtc.ToLocalTime();
                     var endLocal = endedAt.ToLocalTime();
@@ -306,10 +309,18 @@ public sealed class RecoveryService : IRecoveryService
                         }
                     }
 
-                    // Look for unfinalized TS files needing remux
-                    var tsFiles = _fileSystem.Directory.GetFiles(root, "SV_*.ts", SearchOption.AllDirectories);
+                    // Look for unfinalized TS files needing remux (not needed when TS is the chosen format)
+                    var tsFiles = _storageSettings.OutputFormat == OutputContainerFormat.Ts
+                        ? Array.Empty<string>()
+                        : _fileSystem.Directory.GetFiles(root, "SV_*.ts", SearchOption.AllDirectories);
                     foreach (var ts in tsFiles)
                     {
+                        // A part that is being written right now belongs to the running recording.
+                        if (IsFileInUse(ts))
+                        {
+                            continue;
+                        }
+
                         var mkv = _fileSystem.Path.ChangeExtension(ts, ".mkv");
                         var mp4 = _fileSystem.Path.ChangeExtension(ts, ".mp4");
 
@@ -325,6 +336,11 @@ public sealed class RecoveryService : IRecoveryService
                         recoveredCount++;
                         var finalPath = _storageSettings.OutputFormat == OutputContainerFormat.Mp4 ? mp4 : mkv;
 
+                        // Tie the job to its session so the manifest records the result.
+                        var nameMatch = segmentFileRegex.Match(_fileSystem.Path.GetFileName(ts));
+                        var recoveredSessionId = nameMatch.Success ? nameMatch.Groups["sessionId"].Value : null;
+                        var recoveredPart = nameMatch.Success && int.TryParse(nameMatch.Groups["part"].Value, out var parsedPart) ? parsedPart : 1;
+
                         var job = new RemuxJob
                         {
                             TsPath = ts,
@@ -333,7 +349,9 @@ public sealed class RecoveryService : IRecoveryService
                             KeepTsAfterRemux = _storageSettings.KeepTsAfterRemux,
                             SessionTitle = "Recovered ScreenVault Recording",
                             SegmentStartUtc = _fileSystem.File.GetCreationTimeUtc(ts),
-                            SegmentEndUtc = _fileSystem.File.GetLastWriteTimeUtc(ts)
+                            SegmentEndUtc = _fileSystem.File.GetLastWriteTimeUtc(ts),
+                            SessionId = recoveredSessionId,
+                            SegmentIndex = recoveredPart
                         };
 
                         _postProcessor.Enqueue(job);
@@ -360,5 +378,22 @@ public sealed class RecoveryService : IRecoveryService
         var result = new RecoveryResultEventArgs(hadInterrupted, recoveredCount, notificationMessage);
         RecoveryCompleted?.Invoke(this, result);
         return result;
+    }
+
+    private bool IsFileInUse(string path)
+    {
+        try
+        {
+            using var stream = _fileSystem.FileStream.New(path, FileMode.Open, FileAccess.Read, FileShare.None);
+            return false;
+        }
+        catch (IOException)
+        {
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return true;
+        }
     }
 }
