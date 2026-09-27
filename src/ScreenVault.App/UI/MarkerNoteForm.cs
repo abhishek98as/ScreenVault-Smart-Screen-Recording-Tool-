@@ -1,71 +1,67 @@
+using ScreenVault.App.UI.Controls;
+using ScreenVault.App.UI.Theming;
+
 namespace ScreenVault.App.UI;
 
-public sealed class MarkerNoteForm : Form
+/// <summary>Small always-on-top popup for naming a marker (Enter saves, Esc cancels).</summary>
+public sealed class MarkerNoteForm : ModernForm
 {
-    private readonly TextBox _textBox;
-    private readonly Button _btnSave;
-    private readonly Button _btnCancel;
+    private readonly TextField _textBox;
 
     public string NoteText => _textBox.Text.Trim();
 
     public MarkerNoteForm(string timestampText = "")
+        : base(WindowChrome.Borderless)
     {
         Text = "Add Marker — ScreenVault";
-        var appIcon = Platform.AppIcon.Get();
-        if (appIcon != null) Icon = appIcon;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
-        MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterScreen;
-        AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(360, 130);
+        ClientSize = new Size(420, 172);
         TopMost = true;
 
-        var lblPrompt = new Label
+        var badge = new GlyphBadge { Glyph = Glyphs.Flag, Tone = Tone.Accent, Bounds = new Rectangle(20, 20, 36, 36) };
+        var title = new TextLabel("Add marker", Typography.Subtitle) { Location = new Point(68, 18) };
+        var subtitle = new TextLabel(
+            string.IsNullOrEmpty(timestampText) ? "Find this moment later in the recording" : $"At {timestampText} · find this moment later in the recording",
+            Typography.Caption,
+            TextTone.Secondary)
         {
-            Text = string.IsNullOrEmpty(timestampText)
-                ? "Enter marker note (optional):"
-                : $"Enter marker note for {timestampText}:",
-            Location = new Point(16, 14),
-            AutoSize = true
+            Location = new Point(68, 42)
         };
 
-        _textBox = new TextBox
+        _textBox = new TextField
         {
-            Location = new Point(16, 40),
-            Width = 328,
-            Font = new Font("Segoe UI", 9.5f)
+            Bounds = new Rectangle(20, 72, 380, 32),
+            PlaceholderText = "What happened? (optional)",
+            LeadingGlyph = Glyphs.Tag
         };
 
-        _btnSave = new Button
+        var btnSave = new ModernButton("Save marker", ButtonKind.Primary, Glyphs.CheckMark)
         {
-            Text = "Save",
             DialogResult = DialogResult.OK,
-            Location = new Point(180, 80),
-            Width = 75,
-            Height = 28
+            Bounds = new Rectangle(196, 122, 116, 32)
         };
 
-        _btnCancel = new Button
+        var btnCancel = new ModernButton("Cancel", ButtonKind.Secondary)
         {
-            Text = "Cancel",
             DialogResult = DialogResult.Cancel,
-            Location = new Point(265, 80),
-            Width = 75,
-            Height = 28
+            Bounds = new Rectangle(320, 122, 80, 32)
         };
 
-        AcceptButton = _btnSave;
-        CancelButton = _btnCancel;
+        AcceptButton = btnSave;
+        CancelButton = btnCancel;
 
-        Controls.Add(lblPrompt);
-        Controls.Add(_textBox);
-        Controls.Add(_btnSave);
-        Controls.Add(_btnCancel);
+        Controls.AddRange([badge, title, subtitle, _textBox, btnSave, btnCancel]);
+        EnableDrag(this);
+        EnableDrag(title);
+        EnableDrag(subtitle);
+
+        ResumeLayout(false);
+        PerformLayout();
 
         Shown += (_, _) =>
         {
+            Activate();
             _textBox.Focus();
         };
     }

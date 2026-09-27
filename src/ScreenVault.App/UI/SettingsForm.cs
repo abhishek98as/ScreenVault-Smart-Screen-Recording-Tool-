@@ -1,6 +1,9 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO.Compression;
 using ScreenVault.App.Platform;
+using ScreenVault.App.UI.Controls;
+using ScreenVault.App.UI.Theming;
 using ScreenVault.Core.Audio;
 using ScreenVault.Core.Ffmpeg;
 using ScreenVault.Core.Settings;
@@ -8,75 +11,80 @@ using Serilog;
 
 namespace ScreenVault.App.UI;
 
-public sealed class SettingsForm : Form
+/// <summary>Windows 11 style settings: sidebar navigation, grouped setting cards, Save/Apply footer.</summary>
+public sealed class SettingsForm : ModernForm
 {
     private readonly ISettingsService _settingsService;
-    private AppSettings _workingCopy;
-
-    // General controls
-    private readonly CheckBox _chkStartWithWindows;
-    private readonly CheckBox _chkAutoStartRecording;
-    private readonly CheckBox _chkStartMinimized;
-    private readonly NumericUpDown _numStartupDelay;
-    private readonly CheckBox _chkConfirmStop;
-    private readonly CheckBox _chkNotifyDevice;
-    private readonly CheckBox _chkNotifyStorage;
-
-    // Video controls
-    private readonly ComboBox _cmbFrameRate;
-    private readonly ComboBox _cmbQuality;
-    private readonly ComboBox _cmbEncoder;
-    private readonly Button _btnRedetectEncoder;
-    private readonly CheckBox _chkCaptureCursor;
-    private readonly CheckBox _chkDownscale;
-    private readonly ListView _lstProbeResults;
-
-    // Audio controls
-    private readonly ComboBox _cmbMicMode;
-    private readonly ComboBox _cmbOutputMode;
-    private readonly TrackBar _trkMicGain;
-    private readonly Label _lblMicGainVal;
-    private readonly TrackBar _trkSysGain;
-    private readonly Label _lblSysGainVal;
-    private readonly NumericUpDown _numJitterBuffer;
-    private readonly NumericUpDown _numAvOffset;
-
-    // Storage & Saving controls
-    private readonly ListBox _lstLocations;
-    private readonly Button _btnAddLocation;
-    private readonly Button _btnRemoveLocation;
-    private readonly ComboBox _cmbSplitMinutes;
-    private readonly ComboBox _cmbOutputFormat;
-    private readonly CheckBox _chkKeepTs;
-    private readonly CheckBox _chkFailback;
-    private readonly CheckBox _chkRetention;
-    private readonly NumericUpDown _numRetentionDays;
-    private readonly CheckBox _chkShowSavedDialog;
-    private readonly CheckBox _chkMergeOnSave;
-    private readonly CheckBox _chkDeletePartsAfterMerge;
-
-    // Hotkey controls
-    private readonly TextBox _txtHkStartStop;
-    private readonly TextBox _txtHkMuteMic;
-    private readonly TextBox _txtHkMarker;
-    private readonly TextBox _txtHkPause;
-    private readonly TextBox _txtHkStatus;
-    private readonly Button _btnResetHotkeys;
-
-    // Advanced controls
-    private readonly TextBox _txtFfmpegPath;
-    private readonly Button _btnBrowseFfmpeg;
-    private readonly ComboBox _cmbLogLevel;
-    private readonly Button _btnOpenLogs;
-    private readonly Button _btnResetDefaults;
-    private readonly Button _btnRerunWizard;
-    private readonly Button _btnExportDiagnostics;
     private readonly IAudioEngine? _audioEngine;
+    private readonly ToolTip _toolTip = ModernToolTip.Create();
+    private readonly System.Windows.Forms.Timer _meterTimer;
+    private readonly NavigationList _nav;
+    private readonly List<StackPanel> _pages = [];
+    private readonly Dictionary<string, long> _freeSpaceCache = new(StringComparer.OrdinalIgnoreCase);
+    private AppSettings _workingCopy;
+    private int _audioPageIndex;
 
-    private readonly Button _btnOk;
-    private readonly Button _btnCancel;
-    private readonly Button _btnApply;
-    private readonly Label _lblValidation;
+    // General
+    private readonly ToggleSwitch _chkStartWithWindows = new();
+    private readonly ToggleSwitch _chkAutoStartRecording = new();
+    private readonly ToggleSwitch _chkStartMinimized = new();
+    private readonly NumberField _numStartupDelay = new() { Minimum = 0, Maximum = 60, Suffix = "s" };
+    private readonly ToggleSwitch _chkConfirmStop = new();
+    private readonly ToggleSwitch _chkNotifyDevice = new();
+    private readonly ToggleSwitch _chkNotifyStorage = new();
+    private readonly ModernComboBox _cmbTheme = new();
+
+    // Video
+    private readonly ModernComboBox _cmbFrameRate = new();
+    private readonly ModernComboBox _cmbQuality = new();
+    private readonly ModernComboBox _cmbEncoder = new();
+    private readonly ModernButton _btnRedetectEncoder = new("Detect now", ButtonKind.Secondary, Glyphs.Refresh);
+    private readonly ToggleSwitch _chkCaptureCursor = new();
+    private readonly ToggleSwitch _chkDownscale = new();
+    private readonly ThemedListView _lstProbeResults = new();
+    private readonly SettingRow _encoderRow;
+
+    // Audio
+    private readonly ModernComboBox _cmbMicMode = new();
+    private readonly ModernComboBox _cmbOutputMode = new();
+    private readonly ModernSlider _trkMicGain = new() { Minimum = -20, Maximum = 20, Origin = 0 };
+    private readonly TextLabel _lblMicGainVal = new("0 dB", Typography.BodyStrong);
+    private readonly ModernSlider _trkSysGain = new() { Minimum = -20, Maximum = 20, Origin = 0 };
+    private readonly TextLabel _lblSysGainVal = new("0 dB", Typography.BodyStrong);
+    private readonly VuMeterControl _vuMic = new() { AccessibleName = "Microphone level" };
+    private readonly VuMeterControl _vuSys = new() { AccessibleName = "System audio level" };
+    private readonly NumberField _numJitterBuffer = new() { Minimum = 30, Maximum = 500, Increment = 10, Suffix = "ms" };
+    private readonly NumberField _numAvOffset = new() { Minimum = -500, Maximum = 500, Increment = 10, Suffix = "ms" };
+
+    // Storage & saving
+    private readonly ThemedListBox _lstLocations = new() { ItemHeightLogical = 56 };
+    private readonly ModernButton _btnAddLocation = new("Add folder…", ButtonKind.Secondary, Glyphs.Add);
+    private readonly ModernButton _btnRemoveLocation = new("Remove", ButtonKind.Subtle, Glyphs.Delete);
+    private readonly ModernButton _btnMoveUp = new("Move up", ButtonKind.Subtle, Glyphs.ChevronUp);
+    private readonly ModernButton _btnMoveDown = new("Move down", ButtonKind.Subtle, Glyphs.ChevronDown);
+    private readonly ModernComboBox _cmbSplitMinutes = new();
+    private readonly ModernComboBox _cmbOutputFormat = new();
+    private readonly ToggleSwitch _chkKeepTs = new();
+    private readonly ToggleSwitch _chkFailback = new();
+    private readonly ToggleSwitch _chkRetention = new();
+    private readonly NumberField _numRetentionDays = new() { Minimum = 1, Maximum = 365, Value = 30, Suffix = "days" };
+    private readonly ToggleSwitch _chkShowSavedDialog = new();
+    private readonly ToggleSwitch _chkMergeOnSave = new();
+    private readonly ToggleSwitch _chkDeletePartsAfterMerge = new();
+
+    // Hotkeys
+    private readonly HotkeyField _txtHkStartStop = new() { AccessibleName = "Start or stop shortcut" };
+    private readonly HotkeyField _txtHkMuteMic = new() { AccessibleName = "Mute microphone shortcut" };
+    private readonly HotkeyField _txtHkMarker = new() { AccessibleName = "Add marker shortcut" };
+    private readonly HotkeyField _txtHkPause = new() { AccessibleName = "Pause or resume shortcut" };
+    private readonly HotkeyField _txtHkStatus = new() { AccessibleName = "Show status shortcut" };
+
+    // Advanced
+    private readonly TextField _txtFfmpegPath = new() { PlaceholderText = "Bundled FFmpeg (recommended)" };
+    private readonly ModernComboBox _cmbLogLevel = new();
+
+    // Footer
+    private readonly TextLabel _lblValidation = new(string.Empty, Typography.Body, TextTone.Danger) { AutoSize = false, AutoEllipsis = true };
 
     public SettingsForm(ISettingsService settingsService, IAudioEngine? audioEngine = null)
     {
@@ -85,268 +93,406 @@ public sealed class SettingsForm : Form
         _workingCopy = CloneSettings(_settingsService.Current);
 
         Text = "ScreenVault Settings";
-        var appIcon = AppIcon.Get();
-        if (appIcon != null) Icon = appIcon;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
-        MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(620, 560);
+        ClientSize = new Size(920, 660);
+        MinimumSize = new Size(780, 540);
+        MaximizeBox = true;
+        MinimizeBox = true;
 
-        var tabControl = new TabControl
-        {
-            Location = new Point(14, 12),
-            Size = new Size(592, 475)
-        };
-
-        // 1. General Tab
-        var tabGeneral = new TabPage("General") { Padding = new Padding(12) };
-        var pnlGeneral = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            RowCount = 7,
-            AutoSize = true,
-            AutoScroll = true
-        };
-        pnlGeneral.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        pnlGeneral.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-
-        _chkStartWithWindows = new CheckBox { Text = "Start with Windows", AutoSize = true, Margin = new Padding(3, 6, 3, 6), UseMnemonic = false };
-        _chkAutoStartRecording = new CheckBox { Text = "Start recording when application launches", AutoSize = true, Margin = new Padding(3, 6, 3, 6), UseMnemonic = false };
-        _chkStartMinimized = new CheckBox { Text = "Start minimized to system tray", AutoSize = true, Margin = new Padding(3, 6, 3, 6), UseMnemonic = false };
-
-        var lblDelay = new Label { Text = "Startup delay (seconds):", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 8, 3, 6), UseMnemonic = false };
-        _numStartupDelay = new NumericUpDown { Minimum = 0, Maximum = 60, Width = 80, MinimumSize = new Size(80, 24), Margin = new Padding(3, 6, 3, 6) };
-
-        _chkConfirmStop = new CheckBox { Text = "Confirm before stopping recording", AutoSize = true, Margin = new Padding(3, 6, 3, 6), UseMnemonic = false };
-        _chkNotifyDevice = new CheckBox { Text = "Show balloon notifications on audio device switches", AutoSize = true, Margin = new Padding(3, 6, 3, 6), UseMnemonic = false };
-        _chkNotifyStorage = new CheckBox { Text = "Show balloon notifications on storage failover events", AutoSize = true, Margin = new Padding(3, 6, 3, 6), UseMnemonic = false };
-
-        pnlGeneral.Controls.Add(_chkStartWithWindows, 0, 0);
-        pnlGeneral.SetColumnSpan(_chkStartWithWindows, 2);
-
-        pnlGeneral.Controls.Add(_chkAutoStartRecording, 0, 1);
-        pnlGeneral.SetColumnSpan(_chkAutoStartRecording, 2);
-
-        pnlGeneral.Controls.Add(_chkStartMinimized, 0, 2);
-        pnlGeneral.SetColumnSpan(_chkStartMinimized, 2);
-
-        pnlGeneral.Controls.Add(lblDelay, 0, 3);
-        pnlGeneral.Controls.Add(_numStartupDelay, 1, 3);
-
-        pnlGeneral.Controls.Add(_chkConfirmStop, 0, 4);
-        pnlGeneral.SetColumnSpan(_chkConfirmStop, 2);
-
-        pnlGeneral.Controls.Add(_chkNotifyDevice, 0, 5);
-        pnlGeneral.SetColumnSpan(_chkNotifyDevice, 2);
-
-        pnlGeneral.Controls.Add(_chkNotifyStorage, 0, 6);
-        pnlGeneral.SetColumnSpan(_chkNotifyStorage, 2);
-
-        tabGeneral.Controls.Add(pnlGeneral);
-
-        // 2. Video Tab
-        var tabVideo = new TabPage("Video") { Padding = new Padding(12) };
-        var lblFps = new Label { Text = "Frame rate:", Location = new Point(20, 20), AutoSize = true };
-        _cmbFrameRate = new ComboBox { Location = new Point(140, 17), Width = 160, DropDownStyle = ComboBoxStyle.DropDownList };
-        _cmbFrameRate.Items.AddRange(["15 fps (Recommended)", "24 fps", "30 fps"]);
-
-        var lblQuality = new Label { Text = "Quality profile:", Location = new Point(20, 55), AutoSize = true };
-        _cmbQuality = new ComboBox { Location = new Point(140, 52), Width = 160, DropDownStyle = ComboBoxStyle.DropDownList };
-        _cmbQuality.Items.AddRange(["Small (lowest CPU)", "Balanced (Default)", "High (Crisp text)"]);
-
-        var lblEncoder = new Label { Text = "Video Encoder:", Location = new Point(20, 90), AutoSize = true };
-        _cmbEncoder = new ComboBox { Location = new Point(140, 87), Width = 160, DropDownStyle = ComboBoxStyle.DropDownList };
+        // ── Combo box items ──────────────────────────────────────────────────────────
+        _cmbTheme.Items.AddRange(["Use Windows setting", "Light", "Dark"]);
+        _cmbFrameRate.Items.AddRange(["15 fps (recommended)", "24 fps", "30 fps"]);
+        _cmbQuality.Items.AddRange(["Small — lowest CPU and size", "Balanced (recommended)", "High — crisp small text"]);
         _cmbEncoder.Items.AddRange(["Auto", "nvenc-d3d11", "amf-d3d11", "qsv-hwmap", "nvenc-sysmem", "amf-sysmem", "qsv-sysmem", "x264"]);
-
-        _btnRedetectEncoder = new Button { Text = "Re-detect", Location = new Point(310, 85), Width = 90, Height = 26 };
-        _btnRedetectEncoder.Click += async (_, _) => await RedetectEncoderAsync().ConfigureAwait(true);
-
-        _chkCaptureCursor = new CheckBox { Text = "Capture mouse cursor", Location = new Point(20, 125), AutoSize = true };
-        _chkDownscale = new CheckBox { Text = "Downscale to 1080p if screen is larger (higher CPU)", Location = new Point(20, 150), AutoSize = true };
-
-        var lblProbeHeader = new Label { Text = "Hardware Encoder Probe Results:", Location = new Point(20, 180), AutoSize = true, Font = new Font(Font, FontStyle.Bold) };
-        _lstProbeResults = new ListView
-        {
-            Location = new Point(20, 205),
-            Size = new Size(540, 180),
-            View = View.Details,
-            FullRowSelect = true,
-            GridLines = true
-        };
-        _lstProbeResults.Columns.Add("Profile", 110);
-        _lstProbeResults.Columns.Add("Status", 80);
-        _lstProbeResults.Columns.Add("Duration", 70);
-        _lstProbeResults.Columns.Add("Details / Diagnostics", 260);
-
-        tabVideo.Controls.AddRange([lblFps, _cmbFrameRate, lblQuality, _cmbQuality, lblEncoder, _cmbEncoder, _btnRedetectEncoder, _chkCaptureCursor, _chkDownscale, lblProbeHeader, _lstProbeResults]);
-
-        // 3. Audio Tab
-        var tabAudio = new TabPage("Audio");
-        var lblMic = new Label { Text = "Microphone mode:", Location = new Point(20, 22), AutoSize = true };
-        _cmbMicMode = new ComboBox { Location = new Point(160, 18), Width = 220, DropDownStyle = ComboBoxStyle.DropDownList };
-        _cmbMicMode.Items.AddRange(["DefaultCommunications (Headset/Hands-Free)", "DefaultMultimedia", "None"]);
-
-        var lblOut = new Label { Text = "System audio mode:", Location = new Point(20, 62), AutoSize = true };
-        _cmbOutputMode = new ComboBox { Location = new Point(160, 58), Width = 220, DropDownStyle = ComboBoxStyle.DropDownList };
-        _cmbOutputMode.Items.AddRange(["DefaultPlusCommunications (All meeting audio)", "Default only", "None"]);
-
-        var lblMicG = new Label { Text = "Mic gain:", Location = new Point(20, 105), AutoSize = true };
-        _trkMicGain = new TrackBar { Minimum = -20, Maximum = 20, Location = new Point(150, 100), Width = 180, TickFrequency = 5 };
-        _lblMicGainVal = new Label { Text = "0 dB", Location = new Point(340, 105), AutoSize = true };
-        _trkMicGain.ValueChanged += (_, _) => _lblMicGainVal.Text = $"{_trkMicGain.Value} dB";
-
-        var lblSysG = new Label { Text = "System audio gain:", Location = new Point(20, 150), AutoSize = true };
-        _trkSysGain = new TrackBar { Minimum = -20, Maximum = 20, Location = new Point(150, 145), Width = 180, TickFrequency = 5 };
-        _lblSysGainVal = new Label { Text = "0 dB", Location = new Point(340, 150), AutoSize = true };
-        _trkSysGain.ValueChanged += (_, _) => _lblSysGainVal.Text = $"{_trkSysGain.Value} dB";
-
-        var lblJitter = new Label { Text = "Jitter target (ms):", Location = new Point(20, 195), AutoSize = true };
-        _numJitterBuffer = new NumericUpDown { Minimum = 20, Maximum = 500, Value = 100, Location = new Point(160, 192), Width = 70 };
-
-        var lblAvOff = new Label { Text = "A/V offset (ms):", Location = new Point(20, 235), AutoSize = true };
-        _numAvOffset = new NumericUpDown { Minimum = -500, Maximum = 500, Value = 0, Location = new Point(160, 232), Width = 70 };
-
-        tabAudio.Controls.AddRange([lblMic, _cmbMicMode, lblOut, _cmbOutputMode, lblMicG, _trkMicGain, _lblMicGainVal, lblSysG, _trkSysGain, _lblSysGainVal, lblJitter, _numJitterBuffer, lblAvOff, _numAvOffset]);
-
-        // 4. Storage Tab
-        var tabStorage = new TabPage("Storage") { Padding = new Padding(12) };
-        var lblLocs = new Label { Text = "Storage Locations (in priority order):", Location = new Point(16, 12), AutoSize = true };
-        _lstLocations = new ListBox { Location = new Point(16, 32), Size = new Size(380, 95) };
-        _btnAddLocation = new Button { Text = "Add…", Location = new Point(406, 32), Width = 80, Height = 28 };
-        _btnAddLocation.Click += (_, _) => AddStorageLocation();
-        _btnRemoveLocation = new Button { Text = "Remove", Location = new Point(406, 66), Width = 80, Height = 28 };
-        _btnRemoveLocation.Click += (_, _) => RemoveStorageLocation();
-
-        var lblSplit = new Label { Text = "Split file every:", Location = new Point(16, 138), AutoSize = true };
-        _cmbSplitMinutes = new ComboBox { Location = new Point(150, 134), Width = 140, DropDownStyle = ComboBoxStyle.DropDownList };
-        _cmbSplitMinutes.Items.AddRange(["5 minutes", "10 minutes (Default)", "15 minutes", "30 minutes", "60 minutes"]);
-
-        var lblFormat = new Label { Text = "Final container:", Location = new Point(16, 170), AutoSize = true };
-        _cmbOutputFormat = new ComboBox { Location = new Point(150, 166), Width = 160, DropDownStyle = ComboBoxStyle.DropDownList };
-        _cmbOutputFormat.Items.AddRange(["MKV (Recommended)", "MP4 (Compatible)", "TS (Raw live format)"]);
-
-        _chkKeepTs = new CheckBox { Text = "Keep raw .ts files after remuxing", Location = new Point(16, 202), AutoSize = true };
-        _chkFailback = new CheckBox { Text = "Return to primary location when space becomes available (10 GB buffer)", Location = new Point(16, 226), AutoSize = true };
-
-        _chkRetention = new CheckBox { Text = "Delete recordings older than:", Location = new Point(16, 252), AutoSize = true };
-        _numRetentionDays = new NumericUpDown { Minimum = 1, Maximum = 365, Value = 30, Location = new Point(220, 250), Width = 60 };
-
-        _chkShowSavedDialog = new CheckBox { Text = "Show 'Recording saved' dialog when recording stops", Location = new Point(16, 282), AutoSize = true };
-        _chkMergeOnSave = new CheckBox { Text = "Merge multi-part sessions into single file on save", Location = new Point(16, 308), AutoSize = true };
-        _chkDeletePartsAfterMerge = new CheckBox { Text = "Delete individual parts after successful merge", Location = new Point(36, 334), AutoSize = true };
-
-        tabStorage.Controls.AddRange([lblLocs, _lstLocations, _btnAddLocation, _btnRemoveLocation, lblSplit, _cmbSplitMinutes, lblFormat, _cmbOutputFormat, _chkKeepTs, _chkFailback, _chkRetention, _numRetentionDays, _chkShowSavedDialog, _chkMergeOnSave, _chkDeletePartsAfterMerge]);
-
-        // 5. Hotkeys Tab
-        var tabHotkeys = new TabPage("Hotkeys") { Padding = new Padding(12) };
-        var lblHkR = new Label { Text = "Start / Stop && Save:", Location = new Point(20, 25), AutoSize = true, UseMnemonic = false };
-        _txtHkStartStop = new TextBox { Location = new Point(160, 22), Width = 180, ReadOnly = true };
-
-        var lblHkX = new Label { Text = "Mute mic in recording:", Location = new Point(20, 65), AutoSize = true, UseMnemonic = false };
-        _txtHkMuteMic = new TextBox { Location = new Point(160, 62), Width = 180, ReadOnly = true };
-
-        var lblHkM = new Label { Text = "Add marker:", Location = new Point(20, 105), AutoSize = true, UseMnemonic = false };
-        _txtHkMarker = new TextBox { Location = new Point(160, 102), Width = 180, ReadOnly = true };
-
-        var lblHkP = new Label { Text = "Pause/Resume:", Location = new Point(20, 145), AutoSize = true, UseMnemonic = false };
-        _txtHkPause = new TextBox { Location = new Point(160, 142), Width = 180, ReadOnly = true };
-
-        var lblHkS = new Label { Text = "Show Status:", Location = new Point(20, 185), AutoSize = true, UseMnemonic = false };
-        _txtHkStatus = new TextBox { Location = new Point(160, 182), Width = 180, ReadOnly = true };
-
-        _btnResetHotkeys = new Button { Text = "Reset to Defaults", Location = new Point(160, 225), Width = 130, Height = 28, UseMnemonic = false };
-        _btnResetHotkeys.Click += (_, _) =>
-        {
-            _txtHkStartStop.Text = "Ctrl+Alt+Shift+R";
-            _txtHkMuteMic.Text = "Ctrl+Alt+Shift+X";
-            _txtHkMarker.Text = "Ctrl+Alt+Shift+M";
-            _txtHkPause.Text = "Ctrl+Alt+Shift+P";
-            _txtHkStatus.Text = "Ctrl+Alt+Shift+S";
-        };
-
-        tabHotkeys.Controls.AddRange([lblHkR, _txtHkStartStop, lblHkX, _txtHkMuteMic, lblHkM, _txtHkMarker, lblHkP, _txtHkPause, lblHkS, _txtHkStatus, _btnResetHotkeys]);
-
-        // 6. Advanced Tab
-        var tabAdvanced = new TabPage("Advanced");
-        var lblFfmpeg = new Label { Text = "FFmpeg executable path:", Location = new Point(20, 25), AutoSize = true };
-        _txtFfmpegPath = new TextBox { Location = new Point(20, 48), Width = 380 };
-        _btnBrowseFfmpeg = new Button { Text = "Browse…", Location = new Point(410, 46), Width = 75, Height = 26, UseMnemonic = false };
-        _btnBrowseFfmpeg.Click += (_, _) => BrowseFfmpeg();
-
-        var lblLog = new Label { Text = "Log level:", Location = new Point(20, 95), AutoSize = true };
-        _cmbLogLevel = new ComboBox { Location = new Point(100, 92), Width = 140, DropDownStyle = ComboBoxStyle.DropDownList };
+        _cmbMicMode.Items.AddRange(["Windows default – communications (recommended)", "Windows default – multimedia", "Don't record the microphone"]);
+        _cmbOutputMode.Items.AddRange(["Default + communications (recommended)", "Default output only", "Don't record system audio"]);
+        _cmbSplitMinutes.Items.AddRange(["5 minutes", "10 minutes (recommended)", "15 minutes", "30 minutes", "60 minutes"]);
+        _cmbOutputFormat.Items.AddRange(["MKV (recommended)", "MP4 (most compatible)", "TS (raw live format)"]);
         _cmbLogLevel.Items.AddRange(["Debug", "Information", "Warning", "Error"]);
-
-        _btnOpenLogs = new Button { Text = "Open Logs Folder", Location = new Point(20, 140), Width = 150, Height = 28, UseMnemonic = false };
-        _btnOpenLogs.Click += (_, _) => OpenLogsFolder();
-
-        _btnExportDiagnostics = new Button { Text = "Export Diagnostics…", Location = new Point(185, 140), Width = 150, Height = 28, UseMnemonic = false };
-        _btnExportDiagnostics.Click += (_, _) => ExportDiagnostics();
-
-        _btnRerunWizard = new Button { Text = "Re-run Setup Wizard…", Location = new Point(20, 185), Width = 150, Height = 28, UseMnemonic = false };
-        _btnRerunWizard.Click += (_, _) => RerunWizard();
-
-        _btnResetDefaults = new Button { Text = "Reset All to Defaults", Location = new Point(185, 185), Width = 150, Height = 28, UseMnemonic = false };
-        _btnResetDefaults.Click += (_, _) => ResetAllDefaults();
-
-        // About Box (Section 5.7)
-        var aboutInfo = GetAboutInfo();
-        var grpAbout = new GroupBox
+        foreach (var combo in new[] { _cmbTheme, _cmbFrameRate, _cmbQuality, _cmbEncoder, _cmbMicMode, _cmbOutputMode, _cmbSplitMinutes, _cmbOutputFormat, _cmbLogLevel })
         {
-            Text = "About ScreenVault",
-            Location = new Point(20, 225),
-            Size = new Size(540, 160)
-        };
+            combo.Width = 260;
+        }
 
-        var lblAboutVersion = new Label { Text = $"Version: {aboutInfo.Version}", Location = new Point(16, 26), AutoSize = true, Font = new Font(Font, FontStyle.Bold) };
-        var lblAboutScope = new Label { Text = $"Install Scope: {aboutInfo.Scope}", Location = new Point(16, 52), AutoSize = true };
-        var lblAboutPath = new Label { Text = $"Install Path: {aboutInfo.InstallPath}", Location = new Point(16, 78), AutoSize = true };
-        var lblAboutFfmpeg = new Label { Text = $"FFmpeg: {aboutInfo.FfmpegVersion}", Location = new Point(16, 104), AutoSize = true };
-
-        grpAbout.Controls.AddRange([lblAboutVersion, lblAboutScope, lblAboutPath, lblAboutFfmpeg]);
-
-        tabAdvanced.Controls.AddRange([lblFfmpeg, _txtFfmpegPath, _btnBrowseFfmpeg, lblLog, _cmbLogLevel, _btnOpenLogs, _btnExportDiagnostics, _btnRerunWizard, _btnResetDefaults, grpAbout]);
-
-        tabControl.TabPages.AddRange([tabGeneral, tabVideo, tabAudio, tabStorage, tabHotkeys, tabAdvanced]);
-
-        // Bottom buttons
-        _lblValidation = new Label
+        _numStartupDelay.Width = 110;
+        _numJitterBuffer.Width = 120;
+        _numAvOffset.Width = 120;
+        _numRetentionDays.Width = 130;
+        foreach (var hotkey in new[] { _txtHkStartStop, _txtHkMuteMic, _txtHkMarker, _txtHkPause, _txtHkStatus })
         {
-            Location = new Point(18, 516),
-            Size = new Size(260, 20),
-            ForeColor = Color.Red,
-            Text = string.Empty,
-            UseMnemonic = false
-        };
+            hotkey.Width = 260;
+        }
 
-        _btnOk = new Button { Text = "OK", Location = new Point(310, 510), Width = 75, Height = 28, UseMnemonic = false };
-        _btnOk.Click += (_, _) => { if (SaveWorkingCopy()) { DialogResult = DialogResult.OK; Close(); } };
+        // ── Pages ────────────────────────────────────────────────────────────────────
+        var host = new SurfacePanel { Size = new Size(688, 588), Dock = DockStyle.Fill };
 
-        _btnCancel = new Button { Text = "Cancel", Location = new Point(395, 510), Width = 75, Height = 28, DialogResult = DialogResult.Cancel, UseMnemonic = false };
-        _btnApply = new Button { Text = "Apply", Location = new Point(480, 510), Width = 75, Height = 28, UseMnemonic = false };
-        _btnApply.Click += (_, _) => SaveWorkingCopy();
+        // General
+        var general = CreatePage("General", "Startup behavior, confirmations, notifications and appearance.");
+        general.Controls.Add(Section("Startup"));
+        general.Controls.Add(Card(
+            Row("Start with Windows", "Open ScreenVault in the notification area when you sign in.", _chkStartWithWindows, Glyphs.Monitor),
+            Row("Start recording automatically", "Begin recording as soon as ScreenVault starts, after the startup delay.", _chkAutoStartRecording, Glyphs.Record),
+            Row("Start minimized to the tray", "Don't open the status window when ScreenVault starts.", _chkStartMinimized, Glyphs.Pin),
+            Row("Startup delay", "Gives Windows audio time to get ready after you sign in.", _numStartupDelay, Glyphs.Clock)));
+        general.Controls.Add(Section("Recording"));
+        general.Controls.Add(Card(
+            Row("Confirm before stopping", "Ask before a recording is stopped from the tray or the status window.", _chkConfirmStop, Glyphs.Stop)));
+        general.Controls.Add(Section("Notifications"));
+        general.Controls.Add(Card(
+            Row("Audio device changes", "Notify when the microphone or speakers switch. Recording always continues.", _chkNotifyDevice, Glyphs.Headphones),
+            Row("Storage events", "Notify when recording moves to another drive or space runs low.", _chkNotifyStorage, Glyphs.HardDrive)));
+        general.Controls.Add(Section("Appearance"));
+        general.Controls.Add(Card(
+            Row("Theme", "Choose light or dark, or follow the app mode set in Windows.", _cmbTheme, Glyphs.Monitor)));
 
-        Controls.Add(tabControl);
-        Controls.Add(_lblValidation);
-        Controls.Add(_btnOk);
-        Controls.Add(_btnCancel);
-        Controls.Add(_btnApply);
+        // Video
+        var video = CreatePage("Video", "Frame rate, quality and the encoder used to compress your screen.");
+        video.Controls.Add(Section("Capture"));
+        video.Controls.Add(Card(
+            Row("Frame rate", "15 fps keeps files small and is smooth enough for screen sharing and slides.", _cmbFrameRate, Glyphs.Video),
+            Row("Quality", "Higher quality keeps small text crisp but creates larger files.", _cmbQuality, Glyphs.Monitor),
+            Row("Capture mouse cursor", "Show the pointer in recordings.", _chkCaptureCursor),
+            Row("Downscale to 1080p", "Recommended for 4K screens. Uses more CPU.", _chkDownscale)));
+        video.Controls.Add(Section("Encoder"));
+        _encoderRow = Row("Video encoder", "Auto picks the fastest encoder that works on this PC.", _cmbEncoder, Glyphs.Speed);
+        _btnRedetectEncoder.Size = new Size(128, 32);
+        _btnRedetectEncoder.Click += async (_, _) => await RedetectEncoderAsync().ConfigureAwait(true);
+        video.Controls.Add(Card(
+            _encoderRow,
+            Row("Hardware encoder test", "Tries every encoder on this PC and keeps the fastest one that works. Takes up to a minute.", _btnRedetectEncoder, Glyphs.Diagnostic)));
 
-        tabControl.SelectedIndexChanged += (_, _) =>
+        _lstProbeResults.Columns.Add("Encoder", 140);
+        _lstProbeResults.Columns.Add("Result", 110);
+        _lstProbeResults.Columns.Add("Time", 80, HorizontalAlignment.Right);
+        _lstProbeResults.Columns.Add("Details", 240);
+        _lstProbeResults.Height = 200;
+        _lstProbeResults.EmptyText = "Run the hardware encoder test to see which encoders work on this PC.";
+        _lstProbeResults.CellPainter = PaintProbeCell;
+        var probeCard = new CardPanel { Padding = new Padding(1, 6, 1, 6), Spacing = 0 };
+        probeCard.Controls.Add(_lstProbeResults);
+        video.Controls.Add(probeCard);
+
+        // Audio
+        var audio = CreatePage("Audio", "Which microphone and speakers are recorded, and how loud.");
+        audio.Controls.Add(Section("Sources"));
+        audio.Controls.Add(Card(
+            Row("Microphone", "Follows the Windows default, so plugging in a headset just works.", _cmbMicMode, Glyphs.Microphone),
+            Row("System audio", "\"Default + communications\" also captures Teams or Zoom when they use a separate device.", _cmbOutputMode, Glyphs.Volume)));
+        audio.Controls.Add(Section("Levels"));
+        _trkMicGain.ValueChanged += (_, _) => _lblMicGainVal.Text = FormatGain(_trkMicGain.Value);
+        _trkSysGain.ValueChanged += (_, _) => _lblSysGainVal.Text = FormatGain(_trkSysGain.Value);
+        _trkMicGain.AccessibleName = "Microphone gain";
+        _trkSysGain.AccessibleName = "System audio gain";
+        _vuMic.Size = new Size(260, 20);
+        _vuSys.Size = new Size(260, 20);
+        audio.Controls.Add(Card(
+            Row("Microphone gain", "Boost a quiet microphone or soften a loud one.", GainEditor(_trkMicGain, _lblMicGainVal), Glyphs.Microphone),
+            Row("System audio gain", "Balance other participants against your own voice.", GainEditor(_trkSysGain, _lblSysGainVal), Glyphs.Volume),
+            Row("Microphone level", "Speak to check that your voice is picked up.", _vuMic),
+            Row("System audio level", "Play something to check that computer audio is captured.", _vuSys)));
+        audio.Controls.Add(Section("Advanced"));
+        audio.Controls.Add(Card(
+            Row("Jitter buffer", "Smooths out Bluetooth audio. Higher values are steadier.", _numJitterBuffer),
+            Row("Audio / video offset", "Shift the audio if it is out of sync with the picture.", _numAvOffset)));
+
+        // Storage
+        var storage = CreatePage("Storage", "Where recordings are saved and how files are organized.");
+        storage.Controls.Add(Section("Save locations"));
+        storage.Controls.Add(new TextLabel("ScreenVault saves to the first location that has enough free space and moves to the next one automatically if a drive fills up or disconnects.", Typography.Caption, TextTone.Secondary, wrap: true));
+        _lstLocations.Height = 172;
+        _lstLocations.ItemPainter = PaintLocationItem;
+        _lstLocations.SelectedIndexChanged += (_, _) => UpdateLocationButtons();
+        _btnAddLocation.Click += (_, _) => AddStorageLocation();
+        _btnRemoveLocation.Click += (_, _) => RemoveStorageLocation();
+        _btnMoveUp.Click += (_, _) => MoveStorageLocation(-1);
+        _btnMoveDown.Click += (_, _) => MoveStorageLocation(1);
+        var locationButtons = new FlowLayoutPanel
         {
-            _audioEngine?.SetMonitoring(tabControl.SelectedTab == tabAudio);
+            AutoSize = true,
+            WrapContents = true,
+            Padding = new Padding(10, 8, 10, 8)
         };
+        foreach (var button in new[] { _btnAddLocation, _btnMoveUp, _btnMoveDown, _btnRemoveLocation })
+        {
+            // AutoSize (not an explicit size) so the width is computed after DPI scaling.
+            button.AutoSize = true;
+            button.Margin = new Padding(0, 0, 8, 0);
+            locationButtons.Controls.Add(button);
+        }
+
+        var locationsCard = new CardPanel { Padding = new Padding(1, 6, 1, 0), Spacing = 0, Dividers = true };
+        locationsCard.Controls.Add(_lstLocations);
+        locationsCard.Controls.Add(locationButtons);
+        storage.Controls.Add(locationsCard);
+
+        storage.Controls.Add(Section("Files"));
+        storage.Controls.Add(Card(
+            Row("Split recordings every", "Shorter parts limit what could be affected if something goes wrong.", _cmbSplitMinutes, Glyphs.Cut),
+            Row("File format", "MKV is the most robust. MP4 plays everywhere, including phones.", _cmbOutputFormat, Glyphs.Video),
+            Row("Keep raw .ts files", "Keep the live recording files after conversion. Uses more space.", _chkKeepTs),
+            Row("Return to the primary drive", "Switch back once it has enough free space again (10 GB buffer).", _chkFailback)));
+        storage.Controls.Add(Section("Clean-up"));
+        _chkRetention.CheckedChanged += (_, _) => _numRetentionDays.Enabled = _chkRetention.Checked;
+        storage.Controls.Add(Card(
+            Row("Delete old recordings automatically", "Off by default. Protected recordings are always kept.", _chkRetention, Glyphs.Delete),
+            Row("Keep recordings for", null, _numRetentionDays)));
+        storage.Controls.Add(Section("When a recording stops"));
+        _chkMergeOnSave.CheckedChanged += (_, _) => _chkDeletePartsAfterMerge.Enabled = _chkMergeOnSave.Checked;
+        storage.Controls.Add(Card(
+            Row("Show the \"Recording saved\" window", "Rename, play or move the recording right after you stop.", _chkShowSavedDialog, Glyphs.Completed),
+            Row("Merge parts into one file", "Joins the parts of a session into a single video without re-encoding.", _chkMergeOnSave, Glyphs.Merge),
+            Row("Delete parts after merging", "Only after the merged file has been verified.", _chkDeletePartsAfterMerge)));
+
+        // Shortcuts
+        var hotkeys = CreatePage("Shortcuts", "Global keyboard shortcuts work in any app. Click a shortcut and press a new key combination.");
+        hotkeys.Controls.Add(Card(
+            Row("Start / stop & save", null, _txtHkStartStop, Glyphs.Record),
+            Row("Mute microphone in recording", null, _txtHkMuteMic, Glyphs.Microphone),
+            Row("Add marker", null, _txtHkMarker, Glyphs.Flag),
+            Row("Pause / resume", null, _txtHkPause, Glyphs.Pause),
+            Row("Show status window", null, _txtHkStatus, Glyphs.Monitor)));
+        var btnResetHotkeys = new ModernButton("Restore defaults", ButtonKind.Secondary, Glyphs.Refresh) { Size = new Size(150, 32) };
+        btnResetHotkeys.Click += (_, _) =>
+        {
+            var defaults = new HotkeySettings();
+            _txtHkStartStop.Hotkey = defaults.StartStop;
+            _txtHkMuteMic.Hotkey = defaults.MuteMic;
+            _txtHkMarker.Hotkey = defaults.AddMarker;
+            _txtHkPause.Hotkey = defaults.PauseResume;
+            _txtHkStatus.Hotkey = defaults.ShowStatus;
+        };
+        hotkeys.Controls.Add(Card(Row("Default shortcuts", "Ctrl + Alt + Shift with R, X, M, P and S.", btnResetHotkeys, Glyphs.Keyboard)));
+
+        // Advanced
+        var advanced = CreatePage("Advanced", "Troubleshooting tools and options for experienced users.");
+        advanced.Controls.Add(Section("FFmpeg"));
+        advanced.Controls.Add(Card(Row("FFmpeg location", "Leave empty to use the FFmpeg that ships with ScreenVault.", FfmpegEditor(), Glyphs.Folder)));
+        advanced.Controls.Add(Section("Troubleshooting"));
+        var btnOpenLogs = new ModernButton("Open folder", ButtonKind.Secondary, Glyphs.FolderOpen) { Size = new Size(130, 32) };
+        btnOpenLogs.Click += (_, _) => OpenLogsFolder();
+        var btnExportDiagnostics = new ModernButton("Export…", ButtonKind.Secondary, Glyphs.Export) { Size = new Size(130, 32) };
+        btnExportDiagnostics.Click += (_, _) => ExportDiagnostics();
+        advanced.Controls.Add(Card(
+            Row("Log detail", "Use Debug only while investigating a problem.", _cmbLogLevel, Glyphs.Diagnostic),
+            Row("Log files", "Open the folder that contains ScreenVault's logs.", btnOpenLogs),
+            Row("Diagnostics package", "Creates a zip with logs, settings and recent sessions on your Desktop.", btnExportDiagnostics)));
+        advanced.Controls.Add(Section("Maintenance"));
+        var btnRerunWizard = new ModernButton("Run wizard…", ButtonKind.Secondary) { Size = new Size(130, 32) };
+        btnRerunWizard.Click += (_, _) => RerunWizard();
+        var btnResetDefaults = new ModernButton("Reset…", ButtonKind.Destructive, Glyphs.Refresh) { Size = new Size(130, 32) };
+        btnResetDefaults.Click += (_, _) => ResetAllDefaults();
+        advanced.Controls.Add(Card(
+            Row("Setup wizard", "Walk through storage, audio check and startup options again.", btnRerunWizard),
+            Row("Reset all settings", "Restore every setting to its default value (recordings are not touched).", btnResetDefaults)));
+
+        // About
+        var about = CreatePage("About", "Version and install details.");
+        about.Controls.Add(AboutCard());
+
+        _pages.AddRange([general, video, audio, storage, hotkeys, advanced, about]);
+        _audioPageIndex = _pages.IndexOf(audio);
+        foreach (var page in _pages)
+        {
+            host.Controls.Add(page);
+        }
+
+        // ── Footer ───────────────────────────────────────────────────────────────────
+        var footer = new SurfacePanel { Size = new Size(688, 64), Dock = DockStyle.Bottom, TopDivider = true };
+        _lblValidation.Bounds = new Rectangle(24, 22, 300, 20);
+        _lblValidation.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
+        var btnCancel = new ModernButton("Cancel", ButtonKind.Secondary) { Bounds = new Rectangle(344, 16, 96, 32), Anchor = AnchorStyles.Top | AnchorStyles.Right, DialogResult = DialogResult.Cancel };
+        var btnApply = new ModernButton("Apply", ButtonKind.Secondary) { Bounds = new Rectangle(448, 16, 96, 32), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        btnApply.Click += (_, _) => SaveWorkingCopy();
+        var btnSave = new ModernButton("Save", ButtonKind.Primary, Glyphs.CheckMark) { Bounds = new Rectangle(552, 16, 112, 32), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        btnSave.Click += (_, _) =>
+        {
+            if (SaveWorkingCopy())
+            {
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+        };
+        footer.Controls.AddRange([_lblValidation, btnCancel, btnApply, btnSave]);
+        AcceptButton = btnSave;
+        CancelButton = btnCancel;
+
+        // ── Sidebar ──────────────────────────────────────────────────────────────────
+        var sidebar = new SurfacePanel { Surface = SurfaceKind.Sidebar, Size = new Size(232, 660), Dock = DockStyle.Left };
+        var sidebarTitle = new TextLabel("Settings", Typography.Display) { Location = new Point(22, 20) };
+        _nav = new NavigationList { Bounds = new Rectangle(10, 76, 212, 290), AccessibleName = "Settings sections" };
+        _nav.AddItem("General", Glyphs.Settings);
+        _nav.AddItem("Video", Glyphs.Video);
+        _nav.AddItem("Audio", Glyphs.Volume);
+        _nav.AddItem("Storage", Glyphs.HardDrive);
+        _nav.AddItem("Shortcuts", Glyphs.Keyboard);
+        _nav.AddItem("Advanced", Glyphs.Diagnostic);
+        _nav.AddItem("About", Glyphs.Info);
+        _nav.SelectedIndexChanged += (_, _) => ShowPage(_nav.SelectedIndex);
+        sidebar.Controls.AddRange([sidebarTitle, _nav]);
+
+        Controls.Add(host);
+        Controls.Add(footer);
+        Controls.Add(sidebar);
+
+        _meterTimer = new System.Windows.Forms.Timer { Interval = 100 };
+        _meterTimer.Tick += (_, _) => UpdateMeters();
 
         FormClosing += (_, _) =>
         {
+            _meterTimer.Stop();
             _audioEngine?.SetMonitoring(false);
         };
 
         LoadSettingsIntoUi();
+        ShowPage(0);
+
+        ResumeLayout(false);
+        PerformLayout();
     }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _meterTimer.Dispose();
+            _toolTip.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    // ── Layout helpers ───────────────────────────────────────────────────────────────
+
+    private static StackPanel CreatePage(string title, string subtitle)
+    {
+        var page = new StackPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            Padding = new Padding(32, 26, 32, 32),
+            Spacing = 8,
+            Visible = false
+        };
+        page.Controls.Add(new TextLabel(title, Typography.Display));
+        page.Controls.Add(new TextLabel(subtitle, Typography.Body, TextTone.Secondary, wrap: true) { Margin = new Padding(0, 0, 0, 6) });
+        return page;
+    }
+
+    private static TextLabel Section(string text) => new(text, Typography.BodyStrong) { Margin = new Padding(2, 14, 0, 0) };
+
+    private static CardPanel Card(params Control[] rows)
+    {
+        var card = new CardPanel { Dividers = true, Padding = new Padding(0), Spacing = 0 };
+        card.Controls.AddRange(rows);
+        return card;
+    }
+
+    private static SettingRow Row(string title, string? description, Control? control, char glyph = Glyphs.None) => new(title, description, control, glyph);
+
+    private static Panel GainEditor(ModernSlider slider, TextLabel valueLabel)
+    {
+        var panel = new Panel { Size = new Size(260, 32) };
+        slider.Bounds = new Rectangle(0, 2, 200, 28);
+        valueLabel.AutoSize = false;
+        valueLabel.TextAlign = ContentAlignment.MiddleRight;
+        valueLabel.Bounds = new Rectangle(204, 6, 56, 20);
+        panel.Controls.Add(slider);
+        panel.Controls.Add(valueLabel);
+        return panel;
+    }
+
+    private Panel FfmpegEditor()
+    {
+        var panel = new Panel { Size = new Size(380, 32) };
+        _txtFfmpegPath.Bounds = new Rectangle(0, 0, 272, 32);
+        var browse = new ModernButton("Browse…", ButtonKind.Secondary) { Bounds = new Rectangle(280, 0, 100, 32) };
+        browse.Click += (_, _) => BrowseFfmpeg();
+        panel.Controls.Add(_txtFfmpegPath);
+        panel.Controls.Add(browse);
+        return panel;
+    }
+
+    private CardPanel AboutCard()
+    {
+        var info = GetAboutInfo();
+        var card = new CardPanel { Padding = new Padding(0), Spacing = 0, Dividers = true };
+
+        var hero = new Panel { Height = 104 };
+        var appIcon = AppIcon.Get();
+        if (appIcon != null)
+        {
+            using var large = new Icon(appIcon, 64, 64);
+            hero.Controls.Add(new PictureBox { Image = large.ToBitmap(), SizeMode = PictureBoxSizeMode.Zoom, Bounds = new Rectangle(20, 20, 64, 64) });
+        }
+
+        hero.Controls.Add(new TextLabel("ScreenVault", Typography.Title) { Location = new Point(100, 24) });
+        hero.Controls.Add(new TextLabel($"Version {info.Version}", Typography.Body, TextTone.Secondary) { Location = new Point(100, 52) });
+        hero.Controls.Add(new TextLabel("Always-on, crash-proof screen & meeting recorder", Typography.Caption, TextTone.Tertiary) { Location = new Point(100, 74) });
+        card.Controls.Add(hero);
+
+        card.Controls.Add(Row("Install type", null, Value(info.Scope), Glyphs.Shield));
+        var pathValue = Value(info.InstallPath);
+        _toolTip.SetToolTip(pathValue, info.InstallPath);
+        card.Controls.Add(Row("Install location", null, pathValue, Glyphs.Folder));
+        card.Controls.Add(Row("FFmpeg", "Bundled encoder (GPL). See THIRD_PARTY_NOTICES.txt.", Value(info.FfmpegVersion), Glyphs.Video));
+        card.Controls.Add(Row("Privacy", "ScreenVault never connects to the internet. Your recordings stay on your drives and the tray icon is always visible while recording.", null, Glyphs.Lock));
+        return card;
+
+        static TextLabel Value(string text) => new(text, Typography.Body, TextTone.Secondary) { AutoSize = false, AutoEllipsis = true, Size = new Size(320, 20), TextAlign = ContentAlignment.MiddleRight };
+    }
+
+    private void ShowPage(int index)
+    {
+        for (var i = 0; i < _pages.Count; i++)
+        {
+            _pages[i].Visible = i == index;
+        }
+
+        var isAudio = index == _audioPageIndex;
+        _audioEngine?.SetMonitoring(isAudio);
+        if (isAudio && _audioEngine != null)
+        {
+            _meterTimer.Start();
+        }
+        else
+        {
+            _meterTimer.Stop();
+        }
+    }
+
+    private void UpdateMeters()
+    {
+        if (_audioEngine == null)
+        {
+            return;
+        }
+
+        var status = _audioEngine.GetStatus();
+        float micPeak = -60f, micRms = -60f, sysPeak = -60f, sysRms = -60f;
+        foreach (var device in status.ActiveDevices)
+        {
+            if (device.IsLoopback)
+            {
+                sysPeak = Math.Max(sysPeak, device.PeakDb);
+                sysRms = Math.Max(sysRms, device.RmsDb);
+            }
+            else
+            {
+                micPeak = Math.Max(micPeak, device.PeakDb);
+                micRms = Math.Max(micRms, device.RmsDb);
+            }
+        }
+
+        _vuMic.IsMuted = status.IsMicMuted;
+        _vuMic.SetLevels(micPeak, micPeak, micRms, micRms);
+        _vuSys.SetLevels(sysPeak, sysPeak, sysRms, sysRms);
+    }
+
+    private static string FormatGain(int value) => value > 0
+        ? string.Create(CultureInfo.CurrentCulture, $"+{value} dB")
+        : string.Create(CultureInfo.CurrentCulture, $"{value} dB");
+
+    // ── Load / save ──────────────────────────────────────────────────────────────────
 
     private void LoadSettingsIntoUi()
     {
@@ -354,10 +500,16 @@ public sealed class SettingsForm : Form
         _chkStartWithWindows.Checked = _workingCopy.General.StartWithWindows;
         _chkAutoStartRecording.Checked = _workingCopy.General.StartRecordingOnLaunch;
         _chkStartMinimized.Checked = _workingCopy.General.MinimizeToTrayOnLaunch;
-        _numStartupDelay.Value = _workingCopy.General.StartupDelaySeconds;
+        _numStartupDelay.Value = Math.Clamp(_workingCopy.General.StartupDelaySeconds, 0, 60);
         _chkConfirmStop.Checked = _workingCopy.General.ConfirmBeforeStop;
         _chkNotifyDevice.Checked = _workingCopy.General.Notifications.DeviceSwitch;
         _chkNotifyStorage.Checked = _workingCopy.General.Notifications.Storage;
+        _cmbTheme.SelectedIndex = _workingCopy.General.Theme switch
+        {
+            AppThemeMode.Light => 1,
+            AppThemeMode.Dark => 2,
+            _ => 0
+        };
 
         // Video
         _cmbFrameRate.SelectedIndex = _workingCopy.Video.FrameRate switch
@@ -375,10 +527,14 @@ public sealed class SettingsForm : Form
         };
 
         _cmbEncoder.SelectedItem = _workingCopy.Video.Encoder;
-        if (_cmbEncoder.SelectedIndex < 0) _cmbEncoder.SelectedIndex = 0;
+        if (_cmbEncoder.SelectedIndex < 0)
+        {
+            _cmbEncoder.SelectedIndex = 0;
+        }
 
         _chkCaptureCursor.Checked = _workingCopy.Video.CaptureCursor;
         _chkDownscale.Checked = _workingCopy.Video.DownscaleTo1080p;
+        UpdateEncoderDescription(_workingCopy.Video.DetectedEncoderProfile);
 
         // Audio
         _cmbMicMode.SelectedIndex = _workingCopy.Audio.MicMode switch
@@ -394,19 +550,14 @@ public sealed class SettingsForm : Form
             _ => 0
         };
         _trkMicGain.Value = (int)Math.Clamp(_workingCopy.Audio.MicGainDb, -20, 20);
-        _lblMicGainVal.Text = $"{_trkMicGain.Value} dB";
+        _lblMicGainVal.Text = FormatGain(_trkMicGain.Value);
         _trkSysGain.Value = (int)Math.Clamp(_workingCopy.Audio.SystemGainDb, -20, 20);
-        _lblSysGainVal.Text = $"{_trkSysGain.Value} dB";
-        _numJitterBuffer.Value = Math.Clamp(_workingCopy.Audio.JitterTargetMs, 20, 500);
+        _lblSysGainVal.Text = FormatGain(_trkSysGain.Value);
+        _numJitterBuffer.Value = Math.Clamp(_workingCopy.Audio.JitterTargetMs, 30, 500);
         _numAvOffset.Value = Math.Clamp(_workingCopy.Audio.AvOffsetMs, -500, 500);
 
         // Storage
-        _lstLocations.Items.Clear();
-        foreach (var loc in _workingCopy.Storage.Locations)
-        {
-            var expanded = Environment.ExpandEnvironmentVariables(loc.Path);
-            _lstLocations.Items.Add($"{expanded} (min free: {loc.MinFreeGb} GB)");
-        }
+        RefreshLocationList(selectIndex: 0);
 
         _cmbSplitMinutes.SelectedIndex = _workingCopy.Storage.SplitMinutes switch
         {
@@ -427,42 +578,79 @@ public sealed class SettingsForm : Form
         _chkKeepTs.Checked = _workingCopy.Storage.KeepTsAfterRemux;
         _chkFailback.Checked = _workingCopy.Storage.FailbackToPrimary;
         _chkRetention.Checked = _workingCopy.Storage.Retention.Enabled;
-        _numRetentionDays.Value = _workingCopy.Storage.Retention.KeepDays;
+        _numRetentionDays.Value = Math.Clamp(_workingCopy.Storage.Retention.KeepDays, 1, 365);
+        _numRetentionDays.Enabled = _chkRetention.Checked;
 
         // Saving
         _chkShowSavedDialog.Checked = _workingCopy.Saving.ShowSavedDialog;
         _chkMergeOnSave.Checked = _workingCopy.Saving.MergeOnSave;
         _chkDeletePartsAfterMerge.Checked = _workingCopy.Saving.DeletePartsAfterMerge;
+        _chkDeletePartsAfterMerge.Enabled = _chkMergeOnSave.Checked;
 
         // Hotkeys
-        _txtHkStartStop.Text = _workingCopy.Hotkeys.StartStop;
-        _txtHkMuteMic.Text = _workingCopy.Hotkeys.MuteMic;
-        _txtHkMarker.Text = _workingCopy.Hotkeys.AddMarker;
-        _txtHkPause.Text = _workingCopy.Hotkeys.PauseResume;
-        _txtHkStatus.Text = _workingCopy.Hotkeys.ShowStatus;
+        _txtHkStartStop.Hotkey = _workingCopy.Hotkeys.StartStop;
+        _txtHkMuteMic.Hotkey = _workingCopy.Hotkeys.MuteMic;
+        _txtHkMarker.Hotkey = _workingCopy.Hotkeys.AddMarker;
+        _txtHkPause.Hotkey = _workingCopy.Hotkeys.PauseResume;
+        _txtHkStatus.Hotkey = _workingCopy.Hotkeys.ShowStatus;
 
         // Advanced
         _txtFfmpegPath.Text = _workingCopy.Advanced.FfmpegPath ?? string.Empty;
         _cmbLogLevel.SelectedItem = _workingCopy.Advanced.LogLevel;
-        if (_cmbLogLevel.SelectedIndex < 0) _cmbLogLevel.SelectedIndex = 1;
+        if (_cmbLogLevel.SelectedIndex < 0)
+        {
+            _cmbLogLevel.SelectedIndex = 1;
+        }
 
         // Video probe details
         RefreshProbeDetails(EncoderProbe.LastResult?.Details);
+        _lblValidation.Text = string.Empty;
     }
 
     private void RefreshProbeDetails(IReadOnlyList<ProfileProbeStatus>? details)
     {
+        _lstProbeResults.BeginUpdate();
         _lstProbeResults.Items.Clear();
-        if (details == null || details.Count == 0) return;
-
-        foreach (var status in details)
+        if (details != null)
         {
-            var item = new ListViewItem(status.ProfileName);
-            item.SubItems.Add(status.Success ? "✔ Passed" : "✖ Failed");
-            item.SubItems.Add($"{status.Duration.TotalMilliseconds:F0} ms");
-            item.SubItems.Add(status.Reason);
-            _lstProbeResults.Items.Add(item);
+            foreach (var status in details)
+            {
+                var item = new ListViewItem(status.ProfileName) { Tag = status.Success };
+                item.SubItems.Add(status.Success ? "Works" : "Not available");
+                item.SubItems.Add(string.Create(CultureInfo.CurrentCulture, $"{status.Duration.TotalMilliseconds:F0} ms"));
+                item.SubItems.Add(status.Reason);
+                _lstProbeResults.Items.Add(item);
+            }
         }
+
+        _lstProbeResults.EndUpdate();
+    }
+
+    private bool PaintProbeCell(DrawListViewSubItemEventArgs e)
+    {
+        if (e.ColumnIndex != 1 || e.Item?.Tag is not bool success)
+        {
+            return false;
+        }
+
+        var p = Theme.Current;
+        var scale = Draw.Scale(_lstProbeResults);
+        var text = e.SubItem?.Text ?? string.Empty;
+        var tone = success ? Tone.Success : Tone.Neutral;
+        var textWidth = TextRenderer.MeasureText(text, Typography.CaptionStrong).Width;
+        var pill = new RectangleF(e.Bounds.X + (10 * scale), e.Bounds.Y + ((e.Bounds.Height - (22 * scale)) / 2f), textWidth + (16 * scale), 22 * scale);
+        Draw.PrepareHighQuality(e.Graphics);
+        Draw.FillRounded(e.Graphics, p.Soft(tone), pill, pill.Height / 2f);
+        TextRenderer.DrawText(e.Graphics, text, Typography.CaptionStrong, Rectangle.Round(pill), p.Foreground(tone),
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        return true;
+    }
+
+    private void UpdateEncoderDescription(string? detectedProfile)
+    {
+        _encoderRow.Description = string.IsNullOrEmpty(detectedProfile)
+            ? "Auto picks the fastest encoder that works on this PC."
+            : $"Auto picks the fastest encoder that works on this PC. Detected: {detectedProfile}.";
     }
 
     private bool SaveWorkingCopy()
@@ -475,6 +663,12 @@ public sealed class SettingsForm : Form
         _workingCopy.General.ConfirmBeforeStop = _chkConfirmStop.Checked;
         _workingCopy.General.Notifications.DeviceSwitch = _chkNotifyDevice.Checked;
         _workingCopy.General.Notifications.Storage = _chkNotifyStorage.Checked;
+        _workingCopy.General.Theme = _cmbTheme.SelectedIndex switch
+        {
+            1 => AppThemeMode.Light,
+            2 => AppThemeMode.Dark,
+            _ => AppThemeMode.System
+        };
 
         _workingCopy.Video.FrameRate = _cmbFrameRate.SelectedIndex switch
         {
@@ -540,24 +734,38 @@ public sealed class SettingsForm : Form
         _workingCopy.Saving.DeletePartsAfterMerge = _chkDeletePartsAfterMerge.Checked;
 
         // Hotkeys
-        _workingCopy.Hotkeys.StartStop = _txtHkStartStop.Text;
-        _workingCopy.Hotkeys.MuteMic = _txtHkMuteMic.Text;
-        _workingCopy.Hotkeys.AddMarker = _txtHkMarker.Text;
-        _workingCopy.Hotkeys.PauseResume = _txtHkPause.Text;
-        _workingCopy.Hotkeys.ShowStatus = _txtHkStatus.Text;
+        _workingCopy.Hotkeys.StartStop = _txtHkStartStop.Hotkey;
+        _workingCopy.Hotkeys.MuteMic = _txtHkMuteMic.Hotkey;
+        _workingCopy.Hotkeys.AddMarker = _txtHkMarker.Hotkey;
+        _workingCopy.Hotkeys.PauseResume = _txtHkPause.Hotkey;
+        _workingCopy.Hotkeys.ShowStatus = _txtHkStatus.Hotkey;
 
         _workingCopy.Advanced.FfmpegPath = string.IsNullOrWhiteSpace(_txtFfmpegPath.Text) ? null : _txtFfmpegPath.Text.Trim();
         _workingCopy.Advanced.LogLevel = _cmbLogLevel.SelectedItem?.ToString() ?? "Information";
 
+        var errors = new List<string>();
         var validationResult = SettingsValidator.Validate(_workingCopy);
         if (!validationResult.IsValid)
         {
-            _lblValidation.Text = string.Join("; ", validationResult.Errors);
+            errors.AddRange(validationResult.Errors);
+        }
+
+        var shortcuts = new[] { _workingCopy.Hotkeys.StartStop, _workingCopy.Hotkeys.MuteMic, _workingCopy.Hotkeys.AddMarker, _workingCopy.Hotkeys.PauseResume, _workingCopy.Hotkeys.ShowStatus };
+        if (shortcuts.Where(s => !string.IsNullOrWhiteSpace(s)).GroupBy(s => s, StringComparer.OrdinalIgnoreCase).Any(g => g.Count() > 1))
+        {
+            errors.Add("Two actions use the same keyboard shortcut.");
+        }
+
+        if (errors.Count > 0)
+        {
+            _lblValidation.Text = string.Join(" ", errors);
+            _toolTip.SetToolTip(_lblValidation, string.Join(Environment.NewLine, errors));
             return false;
         }
 
         _lblValidation.Text = string.Empty;
         _settingsService.Save(_workingCopy);
+        Theme.SetMode(_workingCopy.General.Theme);
 
         // Update StartWithWindows registry if changed
         try
@@ -575,7 +783,7 @@ public sealed class SettingsForm : Form
     private async Task RedetectEncoderAsync()
     {
         _btnRedetectEncoder.Enabled = false;
-        _btnRedetectEncoder.Text = "Probing…";
+        _btnRedetectEncoder.Text = "Testing…";
         try
         {
             var paths = new FfmpegLocator().Locate();
@@ -583,51 +791,180 @@ public sealed class SettingsForm : Form
             _workingCopy.Video.DetectedEncoderProfile = result.ProfileName;
             _workingCopy.Video.EncoderFingerprint = result.Fingerprint;
             RefreshProbeDetails(result.Details);
-            MessageBox.Show(this, $"Detected best hardware encoder: {result.ProfileName}", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            UpdateEncoderDescription(result.ProfileName);
+            ModernDialog.Success(this, "Encoder test finished", $"The fastest working encoder on this PC is {result.ProfileName}. Save to keep this result.");
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Encoder probe failed: {ex.Message}", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Warning(ex, "Encoder probe failed.");
+            ModernDialog.Warning(this, "Encoder test failed", ex.Message);
         }
         finally
         {
-            _btnRedetectEncoder.Text = "Re-detect";
+            _btnRedetectEncoder.Text = "Detect now";
             _btnRedetectEncoder.Enabled = true;
         }
     }
 
+    // ── Storage locations ────────────────────────────────────────────────────────────
+
+    private void RefreshLocationList(int selectIndex)
+    {
+        _freeSpaceCache.Clear();
+        _lstLocations.BeginUpdate();
+        _lstLocations.Items.Clear();
+        foreach (var location in _workingCopy.Storage.Locations)
+        {
+            _lstLocations.Items.Add(location);
+        }
+
+        _lstLocations.EndUpdate();
+        if (_lstLocations.Items.Count > 0)
+        {
+            _lstLocations.SelectedIndex = Math.Clamp(selectIndex, 0, _lstLocations.Items.Count - 1);
+        }
+
+        UpdateLocationButtons();
+    }
+
+    private void UpdateLocationButtons()
+    {
+        var index = _lstLocations.SelectedIndex;
+        var count = _workingCopy.Storage.Locations.Count;
+        _btnRemoveLocation.Enabled = index >= 0 && count > 1;
+        _btnMoveUp.Enabled = index > 0;
+        _btnMoveDown.Enabled = index >= 0 && index < count - 1;
+    }
+
+    private void PaintLocationItem(DrawItemEventArgs e, object item)
+    {
+        if (item is not StorageLocationConfig location)
+        {
+            return;
+        }
+
+        var p = Theme.Current;
+        var g = e.Graphics;
+        var scale = Draw.Scale(_lstLocations);
+        var expanded = Environment.ExpandEnvironmentVariables(location.Path);
+        var role = e.Index == 0 ? "Primary" : e.Index == 1 ? "Backup" : $"Backup {e.Index}";
+        var tone = e.Index == 0 ? Tone.Accent : Tone.Neutral;
+
+        var left = e.Bounds.X + (int)(16 * scale);
+        var top = e.Bounds.Y + (int)(8 * scale);
+        Glyphs.Draw(g, Glyphs.HardDrive, new Rectangle(left, e.Bounds.Y, (int)(20 * scale), e.Bounds.Height), p.TextSecondary, 12f);
+        left += Glyphs.Available ? (int)(34 * scale) : 0;
+
+        var pillWidth = TextRenderer.MeasureText(role, Typography.CaptionStrong).Width + (int)(16 * scale);
+        var pill = new RectangleF(left, top, pillWidth, 20 * scale);
+        Draw.PrepareHighQuality(g);
+        Draw.FillRounded(g, p.Soft(tone), pill, pill.Height / 2f);
+        TextRenderer.DrawText(g, role, Typography.CaptionStrong, Rectangle.Round(pill), p.Foreground(tone),
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+
+        var pathLeft = left + pillWidth + (int)(10 * scale);
+        TextRenderer.DrawText(g, expanded, Typography.Body, new Rectangle(pathLeft, top, e.Bounds.Right - pathLeft - (int)(12 * scale), (int)(20 * scale)), p.Text,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.PathEllipsis | TextFormatFlags.NoPrefix);
+
+        var detail = $"Keeps at least {location.MinFreeGb} GB free";
+        var free = FreeSpace(expanded);
+        if (free >= 0)
+        {
+            detail += $" · {StorageMeterList.FormatBytes(free)} available now";
+        }
+        else
+        {
+            detail += " · drive not available";
+        }
+
+        if (!location.Enabled)
+        {
+            detail += " · disabled";
+        }
+
+        TextRenderer.DrawText(g, detail, Typography.Caption, new Rectangle(left, top + (int)(24 * scale), e.Bounds.Right - left - (int)(12 * scale), (int)(18 * scale)), p.TextSecondary,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+    }
+
+    private long FreeSpace(string path)
+    {
+        if (_freeSpaceCache.TryGetValue(path, out var cached))
+        {
+            return cached;
+        }
+
+        long free = -1;
+        try
+        {
+            var root = Path.GetPathRoot(path);
+            if (!string.IsNullOrEmpty(root))
+            {
+                var drive = new DriveInfo(root);
+                if (drive.IsReady)
+                {
+                    free = drive.AvailableFreeSpace;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException)
+        {
+            Log.Debug(ex, "Could not read free space for {Path}", path);
+        }
+
+        _freeSpaceCache[path] = free;
+        return free;
+    }
+
     private void AddStorageLocation()
     {
-        using var dlg = new FolderBrowserDialog { Description = "Select a storage folder for ScreenVault recordings" };
+        using var dlg = new FolderBrowserDialog { Description = "Choose a folder for ScreenVault recordings", UseDescriptionForTitle = true };
         if (dlg.ShowDialog(this) == DialogResult.OK)
         {
-            var newEntry = new StorageLocationConfig { Path = dlg.SelectedPath, MinFreeGb = 5, Enabled = true };
-            _workingCopy.Storage.Locations.Add(newEntry);
-            _lstLocations.Items.Add($"{newEntry.Path} (min free: {newEntry.MinFreeGb} GB)");
+            _workingCopy.Storage.Locations.Add(new StorageLocationConfig { Path = dlg.SelectedPath, MinFreeGb = 5, Enabled = true });
+            RefreshLocationList(_workingCopy.Storage.Locations.Count - 1);
         }
     }
 
     private void RemoveStorageLocation()
     {
         var idx = _lstLocations.SelectedIndex;
-        if (idx >= 0 && idx < _workingCopy.Storage.Locations.Count)
+        if (idx < 0 || idx >= _workingCopy.Storage.Locations.Count)
         {
-            if (_workingCopy.Storage.Locations.Count <= 1)
-            {
-                MessageBox.Show(this, "ScreenVault requires at least one storage location.", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            _workingCopy.Storage.Locations.RemoveAt(idx);
-            _lstLocations.Items.RemoveAt(idx);
+            return;
         }
+
+        if (_workingCopy.Storage.Locations.Count <= 1)
+        {
+            ModernDialog.Info(this, "At least one location is needed", "ScreenVault needs somewhere to save recordings. Add another folder before removing this one.");
+            return;
+        }
+
+        _workingCopy.Storage.Locations.RemoveAt(idx);
+        RefreshLocationList(idx);
     }
+
+    private void MoveStorageLocation(int delta)
+    {
+        var idx = _lstLocations.SelectedIndex;
+        var target = idx + delta;
+        var locations = _workingCopy.Storage.Locations;
+        if (idx < 0 || target < 0 || target >= locations.Count)
+        {
+            return;
+        }
+
+        (locations[idx], locations[target]) = (locations[target], locations[idx]);
+        RefreshLocationList(target);
+    }
+
+    // ── Advanced actions ─────────────────────────────────────────────────────────────
 
     private void BrowseFfmpeg()
     {
         using var dlg = new OpenFileDialog
         {
             Filter = "ffmpeg.exe|ffmpeg.exe|All files (*.*)|*.*",
-            Title = "Locate bundled or custom ffmpeg.exe"
+            Title = "Locate ffmpeg.exe"
         };
         if (dlg.ShowDialog(this) == DialogResult.OK)
         {
@@ -642,6 +979,7 @@ public sealed class SettingsForm : Form
         {
             Directory.CreateDirectory(logsDir);
         }
+
         Process.Start("explorer.exe", $"\"{logsDir}\"");
     }
 
@@ -649,7 +987,7 @@ public sealed class SettingsForm : Form
     {
         if (_audioEngine == null)
         {
-            MessageBox.Show(this, "Audio engine is not available.", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            ModernDialog.Info(this, "Audio engine is not available", "The setup wizard needs the audio engine to check your microphone.");
             return;
         }
 
@@ -659,6 +997,8 @@ public sealed class SettingsForm : Form
             _workingCopy = CloneSettings(_settingsService.Current);
             LoadSettingsIntoUi();
         }
+
+        ShowPage(_nav.SelectedIndex);
     }
 
     private void ExportDiagnostics()
@@ -666,7 +1006,7 @@ public sealed class SettingsForm : Form
         try
         {
             var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-            var timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss", System.Globalization.CultureInfo.InvariantCulture);
+            var timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss", CultureInfo.InvariantCulture);
             var zipPath = Path.Combine(desktop, $"ScreenVault_Diagnostics_{timestamp}.zip");
 
             var tempDir = Path.Combine(Path.GetTempPath(), $"sv_diag_{Guid.NewGuid():N}");
@@ -712,7 +1052,7 @@ public sealed class SettingsForm : Form
                 if (File.Exists(zipPath)) File.Delete(zipPath);
                 ZipFile.CreateFromDirectory(tempDir, zipPath, CompressionLevel.Optimal, includeBaseDirectory: false);
 
-                MessageBox.Show(this, $"Diagnostics exported successfully to your Desktop:\n{Path.GetFileName(zipPath)}", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                ModernDialog.Success(this, "Diagnostics exported", $"Saved to your Desktop as {Path.GetFileName(zipPath)}.");
             }
             finally
             {
@@ -725,13 +1065,13 @@ public sealed class SettingsForm : Form
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to export diagnostics.");
-            MessageBox.Show(this, "Failed to export diagnostics: " + ex.Message, "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            ModernDialog.Error(this, "Could not export diagnostics", ex.Message);
         }
     }
 
     private void ResetAllDefaults()
     {
-        if (MessageBox.Show(this, "Reset all settings to default values?", "ScreenVault", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+        if (ModernDialog.Confirm(this, "Reset all settings?", "Every setting returns to its default value when you save. Your recordings are not affected.", "Reset", "Cancel", destructive: true, icon: MessageBoxIcon.Warning))
         {
             _workingCopy = AppSettings.CreateDefault();
             LoadSettingsIntoUi();
@@ -749,11 +1089,11 @@ public sealed class SettingsForm : Form
         var version = typeof(SettingsForm).Assembly.GetName().Version?.ToString(3) ?? "1.2.0";
         var installPath = AppContext.BaseDirectory.TrimEnd('\\');
 
-        string scope = "Per-User";
+        string scope = "Per-user";
         if (StartWithWindows.HasHklmRunEntry() ||
             installPath.Contains("Program Files", StringComparison.OrdinalIgnoreCase))
         {
-            scope = "All Users (Machine)";
+            scope = "All users (machine)";
         }
         else
         {
@@ -775,14 +1115,13 @@ public sealed class SettingsForm : Form
             }
         }
 
-        string ffmpegVersion = "Unknown";
+        string ffmpegVersion = "ffmpeg (bundled)";
         var ffmpegVersionPath = Path.Combine(AppContext.BaseDirectory, "ffmpeg", "VERSION.txt");
         if (File.Exists(ffmpegVersionPath))
         {
             try
             {
-                var lines = File.ReadAllLines(ffmpegVersionPath);
-                var firstLine = lines.FirstOrDefault(l => !string.IsNullOrWhiteSpace(l));
+                var firstLine = File.ReadAllLines(ffmpegVersionPath).FirstOrDefault(l => !string.IsNullOrWhiteSpace(l));
                 if (!string.IsNullOrEmpty(firstLine))
                 {
                     ffmpegVersion = firstLine.Trim();
@@ -793,12 +1132,7 @@ public sealed class SettingsForm : Form
                 ffmpegVersion = "ffmpeg (bundled)";
             }
         }
-        else
-        {
-            ffmpegVersion = "ffmpeg (bundled)";
-        }
 
         return (version, scope, installPath, ffmpegVersion);
     }
 }
-

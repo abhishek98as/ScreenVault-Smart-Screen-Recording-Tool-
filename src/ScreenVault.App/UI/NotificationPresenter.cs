@@ -144,8 +144,8 @@ public sealed class NotificationPresenter : INotificationPresenter
     public void ShowWelcome()
     {
         ShowRateLimited("Welcome", TimeSpan.FromMinutes(1),
-            "ScreenVault Active",
-            "ScreenVault is recording in the background. Look for the camera icon in your system tray (near the clock).",
+            "ScreenVault is running",
+            "Find it in the notification area near the clock. Click its icon to start recording or check the status.",
             ToolTipIcon.Info);
     }
 

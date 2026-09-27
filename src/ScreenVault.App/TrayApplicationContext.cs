@@ -2,6 +2,7 @@ using System.Globalization;
 using ScreenVault.App.Ipc;
 using ScreenVault.App.Platform;
 using ScreenVault.App.UI;
+using ScreenVault.App.UI.Theming;
 using ScreenVault.Core.Audio;
 using ScreenVault.Core.Cli;
 using ScreenVault.Core.Ffmpeg;
@@ -45,6 +46,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly StatusForm _statusForm;
     private SettingsForm? _settingsForm;
     private LibraryForm? _libraryForm;
+    private ContextMenuStrip? _trayMenu;
     private readonly RestartManagerWindow _restartManagerWindow;
 
     private readonly System.Windows.Forms.Timer _trayTimer;
@@ -132,7 +134,8 @@ public sealed class TrayApplicationContext : ApplicationContext
             _markerService,
             _settingsService,
             openSettingsAction: ShowSettingsDialog,
-            playerLauncher: _playerLauncher);
+            playerLauncher: _playerLauncher,
+            openLibraryAction: ShowLibraryDialog);
 
         _restartManagerWindow = new RestartManagerWindow(
             () => _controller.State == RecorderState.Recording,
@@ -184,6 +187,13 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _hotkeyService.ShowStatusPressed += (_, _) => ToggleStatusForm();
         _hotkeyService.RegisterHotkeys();
+
+        // Shortcuts and appearance edited in Settings apply immediately (no restart needed).
+        _settingsService.SettingsChanged += (_, s) => RunOnUi(() =>
+        {
+            _hotkeyService.RegisterHotkeys();
+            Theme.SetMode(s.General.Theme);
+        });
 
         // 4. Controller Events & Watchdogs
         _controller.HealthChanged += OnHealthChanged;
@@ -476,6 +486,8 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void ShowTrayMenu()
     {
+        // The menu is rebuilt on every right-click; dispose the previous one so handles don't leak.
+        _trayMenu?.Dispose();
         var menu = TrayMenuBuilder.Build(
             _controller,
             _audioEngine,
@@ -494,6 +506,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             exitAction: RequestExit);
 
         // Show context menu near mouse cursor
+        _trayMenu = menu;
         menu.Show(Cursor.Position);
     }
 
@@ -707,6 +720,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         Log.Information("ExitThreadCore invoked. CallStack: {Stack}", Environment.StackTrace);
         _statusForm.Dispose();
+        _trayMenu?.Dispose();
         _libraryForm?.Dispose();
         _settingsForm?.Dispose();
         base.ExitThreadCore();

@@ -4,6 +4,8 @@ using System.IO;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using ScreenVault.App.Platform;
+using ScreenVault.App.UI.Controls;
+using ScreenVault.App.UI.Theming;
 using ScreenVault.Core.Audio;
 using ScreenVault.Core.Recording;
 using ScreenVault.Core.Sessions;
@@ -13,7 +15,11 @@ using Serilog;
 
 namespace ScreenVault.App.UI;
 
-public sealed class StatusForm : Form
+/// <summary>
+/// Compact flyout anchored above the tray: live state and timer, the primary Start/Stop action,
+/// the file being written, audio meters, storage health and quick links.
+/// </summary>
+public sealed class StatusForm : ModernForm
 {
     private readonly IRecordingController _controller;
     private readonly IAudioEngine _audioEngine;
@@ -22,48 +28,60 @@ public sealed class StatusForm : Form
     private readonly ISettingsService _settingsService;
     private readonly PlayerLauncher _playerLauncher;
     private readonly Action _openSettingsAction;
+    private readonly Action? _openLibraryAction;
 
     private readonly System.Windows.Forms.Timer _timer10Hz;
     private readonly System.Windows.Forms.Timer _timer1Hz;
+    private readonly ToolTip _toolTip = ModernToolTip.Create();
 
-    private readonly Label _lblState;
-    private readonly Label _lblElapsed;
-    private readonly Label _lblPartElapsed;
-    private readonly Label _lblDegraded;
-    private readonly CheckBox _chkPin;
+    private readonly SurfacePanel _header;
+    private readonly SurfacePanel _content;
+    private readonly SurfacePanel _footer;
+    private readonly ModernButton _btnPin;
 
-    private readonly Label _lblFile;
-    private readonly Button _btnPlay;
+    private readonly SurfacePanel _statusBlock;
+    private readonly StatusPill _pill;
+    private readonly TextLabel _lblPart;
+    private readonly TextLabel _lblElapsed;
+    private readonly TextLabel _lblStats;
+    private readonly CardPanel _warningBanner;
+    private readonly TextLabel _lblDegraded;
+
+    private readonly SurfacePanel _actionsRow;
+    private readonly ModernButton _btnMain;
+    private readonly ModernButton _btnPauseResume;
+    private readonly ModernButton _btnAddMarker;
+
+    private readonly CardPanel _fileCard;
+    private readonly TextLabel _lblFile;
+    private readonly TextLabel _lblFileMeta;
+    private readonly ModernButton _btnPlay;
+    private readonly ModernButton _btnPlayMenu;
     private readonly ContextMenuStrip _playMenu;
 
-    private readonly FlowLayoutPanel _pnlStorage;
-    private readonly Label _lblMicName;
+    private readonly CardPanel _audioCard;
+    private readonly TextLabel _lblMicName;
+    private readonly GlyphIcon _icoMic;
     private readonly VuMeterControl _vuMic;
-    private readonly Label _lblOutName;
+    private readonly TextLabel _lblOutName;
+    private readonly GlyphIcon _icoOut;
     private readonly VuMeterControl _vuOut;
-    private readonly Label _lblAudioSwitch;
-    private readonly Button _btnTestAudio;
+    private readonly TextLabel _lblAudioSwitch;
+    private readonly ModernButton _btnTestAudio;
 
-    private readonly Label _lblVideoStats;
-    private readonly Button _btnMain; // Start Recording / Stop & Save
-    private readonly Button _btnPauseResume;
-    private readonly Button _btnAddMarker;
-    private readonly Button _btnOpenFolder;
-    private readonly Button _btnSettings;
-    private readonly ToolTip _toolTip = new();
+    private readonly CardPanel _storageCard;
+    private readonly StorageMeterList _storageList;
+
+    private readonly Dictionary<string, long> _driveTotals = new(StringComparer.OrdinalIgnoreCase);
 
     private bool _isPinned;
     private bool _isTestingAudio;
     private bool _isStartupComplete;
-
-    public void SetStartupComplete(bool complete = true)
-    {
-        _isStartupComplete = complete;
-        if (IsHandleCreated && !IsDisposed)
-        {
-            BeginInvoke(Refresh1Hz);
-        }
-    }
+    private bool _showWarnings;
+    private float _pulsePhase;
+    private string? _lastSavedFile;
+    private DateTime _lastSavedCheckUtc = DateTime.MinValue;
+    private RecorderState _previousState = RecorderState.Idle;
 
     public StatusForm(
         IRecordingController controller,
@@ -72,7 +90,9 @@ public sealed class StatusForm : Form
         IMarkerService? markerService,
         ISettingsService settingsService,
         Action openSettingsAction,
-        PlayerLauncher? playerLauncher = null)
+        PlayerLauncher? playerLauncher = null,
+        Action? openLibraryAction = null)
+        : base(WindowChrome.Borderless)
     {
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
         _audioEngine = audioEngine ?? throw new ArgumentNullException(nameof(audioEngine));
@@ -80,109 +100,134 @@ public sealed class StatusForm : Form
         _markerService = markerService;
         _settingsService = settingsService ?? throw new ArgumentNullException(nameof(settingsService));
         _openSettingsAction = openSettingsAction ?? throw new ArgumentNullException(nameof(openSettingsAction));
+        _openLibraryAction = openLibraryAction;
         _playerLauncher = playerLauncher ?? new PlayerLauncher(_settingsService);
 
         Text = "ScreenVault Status";
-        var appIcon = AppIcon.Get();
-        if (appIcon != null) Icon = appIcon;
-        FormBorderStyle = FormBorderStyle.FixedToolWindow;
         ShowInTaskbar = true;
         StartPosition = FormStartPosition.Manual;
-        AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(390, 560);
+        ClientSize = new Size(400, 640);
         TopMost = true;
+        KeyPreview = true;
 
-        // Header: State & Time
-        _lblState = new Label
+        // ── Header: brand, pin, close ────────────────────────────────────────────────
+        _header = new SurfacePanel { Size = new Size(400, 48), Dock = DockStyle.Top };
+        var appIcon = AppIcon.Get();
+        if (appIcon != null)
         {
-            Location = new Point(14, 12),
-            Size = new Size(190, 24),
-            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-            Text = "● Ready",
-            ForeColor = Color.FromArgb(30, 142, 62),
-            UseMnemonic = false
-        };
+            using var sizedIcon = new Icon(appIcon, 32, 32);
+            var logo = new PictureBox
+            {
+                Image = sizedIcon.ToBitmap(),
+                SizeMode = PictureBoxSizeMode.Zoom,
+                Bounds = new Rectangle(16, 15, 18, 18)
+            };
+            _header.Controls.Add(logo);
+            EnableDrag(logo);
+        }
 
-        _lblElapsed = new Label
-        {
-            Location = new Point(205, 12),
-            Size = new Size(130, 24),
-            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-            TextAlign = ContentAlignment.TopRight,
-            Text = "00:00:00",
-            UseMnemonic = false
-        };
+        var title = new TextLabel("ScreenVault", Typography.BodyStrong) { Location = new Point(42, 15) };
+        _header.Controls.Add(title);
+        EnableDrag(title);
+        EnableDrag(_header);
 
-        _lblPartElapsed = new Label
+        _btnPin = new ModernButton(string.Empty, ButtonKind.Subtle, Glyphs.Pin)
         {
-            Location = new Point(205, 36),
-            Size = new Size(130, 16),
-            Font = new Font("Segoe UI", 8f),
-            ForeColor = Color.DimGray,
-            TextAlign = ContentAlignment.TopRight,
-            Text = string.Empty,
-            UseMnemonic = false
+            Bounds = new Rectangle(316, 8, 32, 32),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            AccessibleName = "Keep window open"
         };
+        _btnPin.Click += (_, _) => SetPinned(!_isPinned);
+        _toolTip.SetToolTip(_btnPin, "Keep this window open");
 
-        _chkPin = new CheckBox
+        var btnClose = new ModernButton(string.Empty, ButtonKind.Subtle, Glyphs.Close)
         {
-            Appearance = Appearance.Button,
-            Text = "\U0001F4CC",
-            Location = new Point(345, 10),
-            Size = new Size(30, 28),
-            TextAlign = ContentAlignment.MiddleCenter,
-            UseMnemonic = false
+            Bounds = new Rectangle(352, 8, 32, 32),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            AccessibleName = "Close"
         };
-        _chkPin.CheckedChanged += (_, _) =>
-        {
-            _isPinned = _chkPin.Checked;
-            TopMost = _isPinned;
-        };
+        btnClose.Click += (_, _) => Hide();
+        _toolTip.SetToolTip(btnClose, "Close (Esc)");
+        _header.Controls.Add(_btnPin);
+        _header.Controls.Add(btnClose);
 
-        _lblDegraded = new Label
+        // ── Status block: state pill, timer, encoder stats ──────────────────────────
+        _statusBlock = new SurfacePanel { Size = new Size(368, 96) };
+        _pill = new StatusPill { Text = "Preparing…", Tone = Tone.Neutral, Location = new Point(0, 6) };
+        _lblPart = new TextLabel(string.Empty, Typography.Caption, TextTone.Secondary)
         {
-            Location = new Point(16, 38),
-            Size = new Size(200, 18),
-            Font = new Font("Segoe UI", 8.5f),
-            ForeColor = Color.DarkOrange,
-            Text = string.Empty,
-            UseMnemonic = false
+            AutoSize = false,
+            TextAlign = ContentAlignment.MiddleRight,
+            Bounds = new Rectangle(168, 6, 200, 22),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right
         };
-
-        // Group 1: Current Recording File
-        var grpFile = new GroupBox
+        _lblElapsed = new TextLabel("00:00:00", Typography.Timer) { Location = new Point(-4, 30) };
+        _lblStats = new TextLabel(string.Empty, Typography.Caption, TextTone.Tertiary)
         {
-            Text = "Current Recording",
-            Location = new Point(14, 58),
-            Size = new Size(362, 70),
-            Font = new Font("Segoe UI", 8.5f)
+            AutoSize = false,
+            AutoEllipsis = true,
+            Bounds = new Rectangle(0, 74, 368, 18),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         };
+        _statusBlock.Controls.AddRange([_pill, _lblPart, _lblElapsed, _lblStats]);
 
-        _lblFile = new Label
+        _warningBanner = new CardPanel { AccentTone = Tone.Warning, Padding = new Padding(12, 8, 12, 8), Visible = false, Size = new Size(368, 36) };
+        _lblDegraded = new TextLabel(string.Empty, Typography.Caption, TextTone.Warning, wrap: true);
+        _warningBanner.Controls.Add(_lblDegraded);
+
+        // ── Primary actions ──────────────────────────────────────────────────────────
+        _actionsRow = new SurfacePanel { Size = new Size(368, 40) };
+        _btnMain = new ModernButton("Preparing…", ButtonKind.Record, Glyphs.Record)
         {
-            Location = new Point(10, 20),
-            Size = new Size(260, 42),
-            Cursor = Cursors.Hand,
-            Text = "Ready to record",
-            UseMnemonic = false
+            Bounds = new Rectangle(0, 0, 272, 40),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+            Enabled = false
+        };
+        _btnMain.Click += async (_, _) => await OnMainButtonClickedAsync();
+
+        _btnPauseResume = new ModernButton(string.Empty, ButtonKind.Secondary, Glyphs.Pause)
+        {
+            Bounds = new Rectangle(280, 0, 40, 40),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            AccessibleName = "Pause recording",
+            Enabled = false
+        };
+        _btnPauseResume.Click += async (_, _) => await TogglePauseAsync();
+
+        _btnAddMarker = new ModernButton(string.Empty, ButtonKind.Secondary, Glyphs.Flag)
+        {
+            Bounds = new Rectangle(328, 0, 40, 40),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            AccessibleName = "Add marker"
+        };
+        _btnAddMarker.Click += (_, _) => ShowMarkerDialog();
+        _actionsRow.Controls.AddRange([_btnMain, _btnPauseResume, _btnAddMarker]);
+
+        // ── Current file ─────────────────────────────────────────────────────────────
+        _fileCard = new CardPanel { ManualLayout = true, Size = new Size(368, 68) };
+        var fileBadge = new GlyphBadge { Glyph = Glyphs.Video, Tone = Tone.Accent, Bounds = new Rectangle(14, 16, 36, 36) };
+        _lblFile = new TextLabel("No recording yet", Typography.BodyStrong)
+        {
+            AutoSize = false,
+            AutoEllipsis = true,
+            Bounds = new Rectangle(60, 14, 188, 20),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+            Cursor = Cursors.Hand
         };
         _lblFile.Click += (_, _) => RevealCurrentFile();
-
-        // Split button ▶ Play ▾
-        _btnPlay = new Button
+        _lblFileMeta = new TextLabel("Recordings appear here while you record", Typography.Caption, TextTone.Secondary)
         {
-            Text = "▶ Play ▾",
-            Location = new Point(275, 24),
-            Size = new Size(78, 30),
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-            UseMnemonic = false
+            AutoSize = false,
+            AutoEllipsis = true,
+            Bounds = new Rectangle(60, 35, 188, 18),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         };
-        _toolTip.SetToolTip(_btnPlay, "Play Recording (▶)");
-        _playMenu = new ContextMenuStrip();
-        _playMenu.Items.Add("Play Current Part", null, (_, _) => PlayCurrentFile());
-        _playMenu.Items.Add("Play Last Saved File", null, (_, _) => PlayLastSavedFile());
-        _playMenu.Items.Add(new ToolStripSeparator());
-        _playMenu.Items.Add("Open With…", null, (_, _) => OpenWithDialog());
+
+        _btnPlay = new ModernButton("Play", ButtonKind.Secondary, Glyphs.Play)
+        {
+            Bounds = new Rectangle(254, 18, 72, 32),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right
+        };
         _btnPlay.Click += (_, _) =>
         {
             if (_controller.State is RecorderState.Recording or RecorderState.Paused)
@@ -194,179 +239,90 @@ public sealed class StatusForm : Form
                 PlayLastSavedFile();
             }
         };
-        _btnPlay.MouseUp += (s, e) =>
+
+        _btnPlayMenu = new ModernButton(string.Empty, ButtonKind.Subtle, Glyphs.ChevronDown)
         {
-            if (e.Button == MouseButtons.Right || (e.Button == MouseButtons.Left && e.X > _btnPlay.Width - 20))
-            {
-                _playMenu.Show(_btnPlay, 0, _btnPlay.Height);
-            }
+            Bounds = new Rectangle(328, 18, 28, 32),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            AccessibleName = "More playback options"
         };
+        _playMenu = new ContextMenuStrip();
+        ModernMenu.Apply(_playMenu);
+        _playMenu.Items.Add(ModernMenu.Item("Play current part", Glyphs.Play, (_, _) => PlayCurrentFile()));
+        _playMenu.Items.Add(ModernMenu.Item("Play last saved recording", Glyphs.Video, (_, _) => PlayLastSavedFile()));
+        _playMenu.Items.Add(new ToolStripSeparator());
+        _playMenu.Items.Add(ModernMenu.Item("Open with…", Glyphs.OpenWith, (_, _) => OpenWithDialog()));
+        _btnPlayMenu.Click += (_, _) => _playMenu.Show(_btnPlayMenu, new Point(0, _btnPlayMenu.Height));
+        _toolTip.SetToolTip(_btnPlayMenu, "More playback options");
+        _fileCard.Controls.AddRange([fileBadge, _lblFile, _lblFileMeta, _btnPlay, _btnPlayMenu]);
 
-        grpFile.Controls.Add(_lblFile);
-        grpFile.Controls.Add(_btnPlay);
-
-        // Group 2: Audio Levels
-        var grpAudio = new GroupBox
+        // ── Audio ────────────────────────────────────────────────────────────────────
+        _audioCard = new CardPanel { ManualLayout = true, Size = new Size(368, 132) };
+        var audioTitle = new TextLabel("Audio", Typography.Subtitle) { Location = new Point(14, 12) };
+        _btnTestAudio = new ModernButton("Test audio", ButtonKind.Subtle, Glyphs.Microphone)
         {
-            Text = "Audio Levels",
-            Location = new Point(14, 134),
-            Size = new Size(362, 142),
-            Font = new Font("Segoe UI", 8.5f)
-        };
-
-        _lblMicName = new Label { Location = new Point(10, 22), Size = new Size(170, 18), Text = "Mic: ✔ Loading…", UseMnemonic = false };
-        _vuMic = new VuMeterControl { Location = new Point(185, 20), Width = 168 };
-
-        _lblOutName = new Label { Location = new Point(10, 52), Size = new Size(170, 18), Text = "System: ✔ Loading…", UseMnemonic = false };
-        _vuOut = new VuMeterControl { Location = new Point(185, 50), Width = 168 };
-
-        _lblAudioSwitch = new Label
-        {
-            Location = new Point(10, 80),
-            Size = new Size(342, 22),
-            ForeColor = Color.Gray,
-            Font = new Font("Segoe UI", 7.5f),
-            Text = "All audio sources active",
-            UseMnemonic = false
-        };
-
-        _btnTestAudio = new Button
-        {
-            Text = "Test Audio",
-            Location = new Point(10, 106),
-            Size = new Size(90, 26),
-            Font = new Font("Segoe UI", 8f),
-            UseMnemonic = false
+            Bounds = new Rectangle(248, 8, 108, 28),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right
         };
         _btnTestAudio.Click += async (_, _) => await RunAudioTestAsync();
-        _toolTip.SetToolTip(_btnTestAudio, "Test Audio (Ready state only)");
+        _toolTip.SetToolTip(_btnTestAudio, "Records 5 seconds from your microphone and plays it back (only while not recording)");
 
-        grpAudio.Controls.Add(_lblMicName);
-        grpAudio.Controls.Add(_vuMic);
-        grpAudio.Controls.Add(_lblOutName);
-        grpAudio.Controls.Add(_vuOut);
-        grpAudio.Controls.Add(_lblAudioSwitch);
-        grpAudio.Controls.Add(_btnTestAudio);
+        _icoMic = new GlyphIcon { Glyph = Glyphs.Microphone, Bounds = new Rectangle(14, 46, 20, 20) };
+        _lblMicName = new TextLabel("Microphone", Typography.Body) { AutoSize = false, AutoEllipsis = true, Bounds = new Rectangle(40, 46, 128, 20) };
+        _vuMic = new VuMeterControl { Bounds = new Rectangle(176, 46, 180, 20), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, AccessibleName = "Microphone level" };
 
-        // Group 3: Storage
-        var grpStorage = new GroupBox
+        _icoOut = new GlyphIcon { Glyph = Glyphs.Volume, Bounds = new Rectangle(14, 76, 20, 20) };
+        _lblOutName = new TextLabel("System audio", Typography.Body) { AutoSize = false, AutoEllipsis = true, Bounds = new Rectangle(40, 76, 128, 20) };
+        _vuOut = new VuMeterControl { Bounds = new Rectangle(176, 76, 180, 20), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, AccessibleName = "System audio level" };
+
+        _lblAudioSwitch = new TextLabel("No device changes yet", Typography.Caption, TextTone.Tertiary)
         {
-            Text = "Storage",
-            Location = new Point(14, 282),
-            Size = new Size(362, 90),
-            Font = new Font("Segoe UI", 8.5f)
+            AutoSize = false,
+            AutoEllipsis = true,
+            Bounds = new Rectangle(14, 104, 342, 18),
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         };
-        _pnlStorage = new FlowLayoutPanel
-        {
-            Location = new Point(8, 18),
-            Size = new Size(346, 64),
-            AutoScroll = true,
-            FlowDirection = FlowDirection.TopDown,
-            WrapContents = false
-        };
-        grpStorage.Controls.Add(_pnlStorage);
+        _audioCard.Controls.AddRange([audioTitle, _btnTestAudio, _icoMic, _lblMicName, _vuMic, _icoOut, _lblOutName, _vuOut, _lblAudioSwitch]);
 
-        // Group 4: Video
-        var grpVideo = new GroupBox
-        {
-            Text = "Video && Encoder",
-            Location = new Point(14, 378),
-            Size = new Size(362, 60),
-            Font = new Font("Segoe UI", 8.5f)
-        };
-        _lblVideoStats = new Label
-        {
-            Location = new Point(10, 20),
-            Size = new Size(342, 32),
-            Text = "Encoder: Loading...",
-            UseMnemonic = false
-        };
-        grpVideo.Controls.Add(_lblVideoStats);
+        // ── Storage ──────────────────────────────────────────────────────────────────
+        _storageCard = new CardPanel { ManualLayout = true, Size = new Size(368, 104) };
+        var storageTitle = new TextLabel("Storage", Typography.Subtitle) { Location = new Point(14, 12) };
+        _storageList = new StorageMeterList { Bounds = new Rectangle(14, 42, 340, 50), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+        _storageCard.Controls.AddRange([storageTitle, _storageList]);
 
-        // Action Buttons Row 1: Main Start / Stop & Save & Pause
-        _btnMain = new Button
-        {
-            Text = "Preparing…",
-            Location = new Point(14, 448),
-            Size = new Size(174, 36),
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-            BackColor = Color.FromArgb(107, 107, 107),
-            ForeColor = Color.White,
-            FlatStyle = FlatStyle.Flat,
-            Enabled = false,
-            UseMnemonic = false
-        };
-        _btnMain.FlatAppearance.BorderSize = 0;
-        _btnMain.Click += async (_, _) => await OnMainButtonClickedAsync();
-        _toolTip.SetToolTip(_btnMain, "Start Recording or Stop & Save (Ctrl+Alt+Shift+R)");
+        // ── Scrollable content ───────────────────────────────────────────────────────
+        _content = new SurfacePanel { Size = new Size(400, 536), Dock = DockStyle.Fill, AutoScroll = true };
+        _content.Controls.AddRange([_statusBlock, _warningBanner, _actionsRow, _fileCard, _audioCard, _storageCard]);
+        _content.Resize += (_, _) => LayoutContent();
 
-        _btnPauseResume = new Button
-        {
-            Text = "⏸ Pause",
-            Location = new Point(194, 448),
-            Size = new Size(182, 36),
-            Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-            UseMnemonic = false
-        };
-        _btnPauseResume.Click += async (_, _) => await TogglePauseAsync();
-        _toolTip.SetToolTip(_btnPauseResume, "Pause or Resume Recording (Ctrl+Alt+Shift+P)");
+        // ── Footer: quick links ──────────────────────────────────────────────────────
+        _footer = new SurfacePanel { Size = new Size(400, 56), Dock = DockStyle.Bottom, TopDivider = true };
+        var btnLibrary = new ModernButton("Recordings", ButtonKind.Subtle, Glyphs.Library) { Bounds = new Rectangle(12, 10, 120, 36) };
+        btnLibrary.Click += (_, _) => _openLibraryAction?.Invoke();
+        btnLibrary.Enabled = _openLibraryAction != null;
+        var btnFolder = new ModernButton("Folder", ButtonKind.Subtle, Glyphs.FolderOpen) { Bounds = new Rectangle(140, 10, 120, 36) };
+        btnFolder.Click += (_, _) => OpenRecordingsFolder();
+        var btnSettings = new ModernButton("Settings", ButtonKind.Subtle, Glyphs.Settings) { Bounds = new Rectangle(268, 10, 120, 36) };
+        btnSettings.Click += (_, _) => _openSettingsAction();
+        _toolTip.SetToolTip(btnLibrary, "Browse, play and export past recordings");
+        _toolTip.SetToolTip(btnFolder, "Open the folder that contains the current recording");
+        _toolTip.SetToolTip(btnSettings, "Settings");
+        _footer.Controls.AddRange([btnLibrary, btnFolder, btnSettings]);
 
-        // Action Buttons Row 2: Add Marker, Open Folder, Settings
-        _btnAddMarker = new Button
-        {
-            Text = "Add Marker",
-            Location = new Point(14, 492),
-            Size = new Size(110, 32),
-            UseMnemonic = false
-        };
-        _btnAddMarker.Click += (_, _) => ShowMarkerDialog();
-        _toolTip.SetToolTip(_btnAddMarker, "Add Marker (Ctrl+Alt+Shift+M)");
+        Controls.Add(_content);
+        Controls.Add(_header);
+        Controls.Add(_footer);
 
-        _btnOpenFolder = new Button
-        {
-            Text = "Open Folder",
-            Location = new Point(130, 492),
-            Size = new Size(116, 32),
-            UseMnemonic = false
-        };
-        _btnOpenFolder.Click += (_, _) => OpenRecordingsFolder();
-        _toolTip.SetToolTip(_btnOpenFolder, "Open Folder (Ctrl+Alt+Shift+O)");
-
-        _btnSettings = new Button
-        {
-            Text = "Settings…",
-            Location = new Point(252, 492),
-            Size = new Size(124, 32),
-            UseMnemonic = false
-        };
-        _btnSettings.Click += (_, _) => _openSettingsAction();
-        _toolTip.SetToolTip(_btnSettings, "Settings…");
-
-        Controls.Add(_lblState);
-        Controls.Add(_lblElapsed);
-        Controls.Add(_lblPartElapsed);
-        Controls.Add(_chkPin);
-        Controls.Add(_lblDegraded);
-        Controls.Add(grpFile);
-        Controls.Add(grpAudio);
-        Controls.Add(grpStorage);
-        Controls.Add(grpVideo);
-        Controls.Add(_btnMain);
-        Controls.Add(_btnPauseResume);
-        Controls.Add(_btnAddMarker);
-        Controls.Add(_btnOpenFolder);
-        Controls.Add(_btnSettings);
-
-        // Timers: 10 Hz (VU meters) and 1 Hz (stats)
+        // Timers: 10 Hz (meters, pulse) and 1 Hz (everything else). Both stop while hidden.
         _timer10Hz = new System.Windows.Forms.Timer { Interval = 100 };
         _timer10Hz.Tick += OnTick10Hz;
-
         _timer1Hz = new System.Windows.Forms.Timer { Interval = 1000 };
-        _timer1Hz.Tick += OnTick1Hz;
+        _timer1Hz.Tick += (_, _) => Refresh1Hz();
 
         Deactivate += (_, _) =>
         {
-            if (!_isPinned)
+            // Stay open while one of our own dialogs (stop confirmation, marker note…) is showing.
+            if (!_isPinned && OwnedForms.Length == 0)
             {
                 Hide();
             }
@@ -377,9 +333,10 @@ public sealed class StatusForm : Form
             if (Visible)
             {
                 _audioEngine.SetMonitoring(true);
+                UpdateToolTips();
+                Refresh1Hz();
                 _timer10Hz.Start();
                 _timer1Hz.Start();
-                Refresh1Hz();
             }
             else
             {
@@ -388,271 +345,456 @@ public sealed class StatusForm : Form
                 _timer1Hz.Stop();
             }
         };
+
+        ResumeLayout(false);
+        PerformLayout();
+    }
+
+    public void SetStartupComplete(bool complete = true)
+    {
+        _isStartupComplete = complete;
+        if (IsHandleCreated && !IsDisposed)
+        {
+            BeginInvoke(Refresh1Hz);
+        }
     }
 
     public void AnchorNearTray()
     {
+        Refresh1Hz();
+        FitToContent(keepBottomEdge: false);
         var screen = Screen.PrimaryScreen?.WorkingArea ?? Screen.AllScreens[0].WorkingArea;
-        Left = screen.Right - Width - 16;
-        Top = screen.Bottom - Height - 16;
+        var margin = LogicalToDeviceUnits(12);
+        Left = screen.Right - Width - margin;
+        Top = screen.Bottom - Height - margin;
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (e.KeyCode == Keys.Escape)
+        {
+            Hide();
+            e.Handled = true;
+        }
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        FitToContent(keepBottomEdge: true);
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            Hide();
+            return;
+        }
+
+        base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _timer10Hz.Dispose();
+            _timer1Hz.Dispose();
+            _playMenu.Dispose();
+            _toolTip.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    private void SetPinned(bool pinned)
+    {
+        _isPinned = pinned;
+        TopMost = pinned;
+        _btnPin.Glyph = pinned ? Glyphs.Pinned : Glyphs.Pin;
+        _btnPin.Kind = pinned ? ButtonKind.Secondary : ButtonKind.Subtle;
+        _btnPin.AccessibleName = pinned ? "Unpin window" : "Keep window open";
+        _toolTip.SetToolTip(_btnPin, pinned ? "Pinned — click to close automatically again" : "Keep this window open");
+    }
+
+    private void UpdateToolTips()
+    {
+        var hotkeys = _settingsService.Current.Hotkeys;
+        _toolTip.SetToolTip(_btnMain, $"Start recording, or stop and save ({HotkeyField.DisplayText(hotkeys.StartStop)})");
+        _toolTip.SetToolTip(_btnPauseResume, $"Pause or resume ({HotkeyField.DisplayText(hotkeys.PauseResume)})");
+        _toolTip.SetToolTip(_btnAddMarker, $"Add a marker to find this moment later ({HotkeyField.DisplayText(hotkeys.AddMarker)})");
+        _toolTip.SetToolTip(_btnPlay, "Play the current part, or the last saved recording");
+        _toolTip.SetToolTip(_lblFile, "Click to show the file in Explorer");
+    }
+
+    /// <summary>Stacks the content blocks and returns the content height (device pixels).</summary>
+    private int LayoutContent()
+    {
+        int S(int value) => LogicalToDeviceUnits(value);
+
+        var width = _content.ClientSize.Width - S(32);
+        if (width <= 0)
+        {
+            return 0;
+        }
+
+        var x = S(16);
+        var y = S(4) + _content.AutoScrollPosition.Y;
+        var spacing = S(10);
+
+        void Place(Control control, int height)
+        {
+            control.SetBounds(x, y, width, height);
+            y += height + spacing;
+        }
+
+        Place(_statusBlock, _statusBlock.Height);
+        if (_showWarnings)
+        {
+            var textHeight = TextLabel.MeasureHeight(_lblDegraded.Text, _lblDegraded.Font, width - _warningBanner.Padding.Horizontal);
+            _warningBanner.Visible = true;
+            Place(_warningBanner, textHeight + _warningBanner.Padding.Vertical);
+        }
+        else
+        {
+            _warningBanner.Visible = false;
+        }
+
+        Place(_actionsRow, _actionsRow.Height);
+        Place(_fileCard, _fileCard.Height);
+        Place(_audioCard, _audioCard.Height);
+        _storageCard.Height = _storageList.Top + _storageList.PreferredHeight + S(10);
+        Place(_storageCard, _storageCard.Height);
+
+        var total = y - spacing + S(12) - _content.AutoScrollPosition.Y;
+        var min = new Size(0, total);
+        if (_content.AutoScrollMinSize != min)
+        {
+            _content.AutoScrollMinSize = min;
+        }
+
+        return total;
+    }
+
+    private void FitToContent(bool keepBottomEdge)
+    {
+        var contentHeight = LayoutContent();
+        var screen = Screen.FromControl(this).WorkingArea;
+        var desired = Math.Min(_header.Height + contentHeight + _footer.Height, screen.Height - LogicalToDeviceUnits(24));
+        if (ClientSize.Height == desired)
+        {
+            return;
+        }
+
+        var bottom = Bottom;
+        ClientSize = new Size(ClientSize.Width, desired);
+        if (keepBottomEdge && Visible)
+        {
+            Top = Math.Max(screen.Top, bottom - Height);
+        }
     }
 
     private void OnTick10Hz(object? sender, EventArgs e)
     {
         var audioStatus = _audioEngine.GetStatus();
-        var micSources = audioStatus.ActiveDevices.Where(d => !d.IsLoopback).ToList();
-        var sysSources = audioStatus.ActiveDevices.Where(d => d.IsLoopback).ToList();
-
-        var micPeak = micSources.Count > 0 ? micSources.Max(s => s.PeakDb) : -60f;
-        var micRms = micSources.Count > 0 ? micSources.Max(s => s.RmsDb) : -60f;
-
-        var sysPeak = sysSources.Count > 0 ? sysSources.Max(s => s.PeakDb) : -60f;
-        var sysRms = sysSources.Count > 0 ? sysSources.Max(s => s.RmsDb) : -60f;
+        float micPeak = -60f, micRms = -60f, sysPeak = -60f, sysRms = -60f;
+        foreach (var device in audioStatus.ActiveDevices)
+        {
+            if (device.IsLoopback)
+            {
+                sysPeak = Math.Max(sysPeak, device.PeakDb);
+                sysRms = Math.Max(sysRms, device.RmsDb);
+            }
+            else
+            {
+                micPeak = Math.Max(micPeak, device.PeakDb);
+                micRms = Math.Max(micRms, device.RmsDb);
+            }
+        }
 
         _vuMic.IsMuted = audioStatus.IsMicMuted;
         _vuMic.SetLevels(micPeak, micPeak, micRms, micRms);
         _vuOut.SetLevels(sysPeak, sysPeak, sysRms, sysRms);
-    }
 
-    private void OnTick1Hz(object? sender, EventArgs e)
-    {
-        Refresh1Hz();
+        // Gentle "live" pulse on the Recording pill.
+        if (_controller.State == RecorderState.Recording)
+        {
+            _pulsePhase = (_pulsePhase + 0.21f) % (MathF.PI * 2f);
+            _pill.DotOpacity = 0.5f + (0.5f * MathF.Cos(_pulsePhase));
+        }
+        else if (_pill.DotOpacity < 1f)
+        {
+            _pill.DotOpacity = 1f;
+        }
     }
 
     private void Refresh1Hz()
     {
         var health = _controller.Health;
+        var elapsed = health.Elapsed.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture);
+        _lblElapsed.Text = elapsed;
 
-        // State, Header color, & Elapsed
-        _lblElapsed.Text = health.Elapsed.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture);
+        _lblPart.Text = health.PartElapsed > TimeSpan.Zero || health.State is RecorderState.Recording or RecorderState.Paused
+            ? $"Part {health.PartIndex} · {health.PartElapsed.ToString(@"mm\:ss", CultureInfo.InvariantCulture)}"
+            : string.Empty;
 
-        if (health.PartElapsed > TimeSpan.Zero || health.State == RecorderState.Recording || health.State == RecorderState.Paused)
+        ApplyStateVisuals(health);
+
+        // Warnings banner (degraded reasons)
+        var warnings = health.DegradedWarnings.Count > 0 ? string.Join(Environment.NewLine, health.DegradedWarnings.Select(w => "• " + w)) : string.Empty;
+        var showWarnings = warnings.Length > 0;
+        var layoutChanged = showWarnings != _showWarnings || (showWarnings && _lblDegraded.Text != warnings);
+        _showWarnings = showWarnings;
+        _lblDegraded.Text = warnings;
+
+        // Current file
+        if (_previousState != health.State)
         {
-            _lblPartElapsed.Text = $"Part {health.PartIndex} · {health.PartElapsed:mm\\:ss}";
+            _lastSavedCheckUtc = DateTime.MinValue; // re-scan after a state change (e.g. a recording was just saved)
+            _previousState = health.State;
+        }
+
+        var hasSavedFile = GetLastSavedFilePath() != null;
+        if (!string.IsNullOrEmpty(health.CurrentFilePath))
+        {
+            var mb = health.CurrentFileBytes / (1024.0 * 1024.0);
+            _lblFile.Text = Path.GetFileName(health.CurrentFilePath);
+            _lblFileMeta.Text = string.Create(CultureInfo.CurrentCulture, $"{mb:F1} MB · Part {health.PartIndex} · click the name to show in folder");
+            _btnPlay.Enabled = File.Exists(health.CurrentFilePath) || hasSavedFile;
         }
         else
         {
-            _lblPartElapsed.Text = string.Empty;
+            _lblFile.Text = hasSavedFile ? "Not recording" : "No recording yet";
+            _lblFileMeta.Text = hasSavedFile ? "Play opens your most recent recording" : "Recordings appear here while you record";
+            _btnPlay.Enabled = hasSavedFile;
         }
 
+        // Audio devices
+        var audioStatus = _audioEngine.GetStatus();
+        ApplyDeviceStatus(_lblMicName, _icoMic, audioStatus.MicDisplayStatus, Glyphs.Microphone, "Microphone");
+        ApplyDeviceStatus(_lblOutName, _icoOut, audioStatus.SystemDisplayStatus, Glyphs.Volume, "System audio");
+        if (audioStatus.IsMicMuted)
+        {
+            _icoMic.Tone = TextTone.Warning;
+        }
+
+        _lblAudioSwitch.Text = $"Last switch: {audioStatus.LastSwitchSummary}";
+        _toolTip.SetToolTip(_lblAudioSwitch, audioStatus.LastSwitchSummary);
+
+        // Storage
+        var storageRowsBefore = _storageList.PreferredHeight;
+        if (_storageManager != null)
+        {
+            _storageList.SetRows(BuildStorageRows(_storageManager.GetStatus()));
+        }
+
+        layoutChanged |= storageRowsBefore != _storageList.PreferredHeight;
+
+        // Encoder stats
+        var targetFps = _settingsService.Current.Video.FrameRate;
+        var actualFps = health.ActualFps > 0 ? health.ActualFps : targetFps;
+        var slow = health.Speed > 0 && health.Speed < 0.97;
+        _lblStats.Text = health.State is RecorderState.Recording or RecorderState.Paused
+            ? string.Create(CultureInfo.CurrentCulture, $"{health.EncoderProfile} · {actualFps:F0} of {targetFps} fps · {health.Speed:F2}× speed{(slow ? " — encoder is falling behind" : string.Empty)}")
+            : string.Create(CultureInfo.CurrentCulture, $"{targetFps} fps · {_settingsService.Current.Video.Quality} quality · {_settingsService.Current.Storage.OutputFormat.ToString().ToUpperInvariant()} files");
+        _lblStats.Tone = slow ? TextTone.Warning : TextTone.Tertiary;
+
+        if (layoutChanged)
+        {
+            FitToContent(keepBottomEdge: true);
+        }
+    }
+
+    private void ApplyStateVisuals(HealthSnapshot health)
+    {
         switch (health.State)
         {
             case RecorderState.Recording:
-                _lblState.Text = health.IsDegraded
-                    ? $"● REC {health.Elapsed:hh\\:mm\\:ss} (Degraded)"
-                    : $"● REC {health.Elapsed:hh\\:mm\\:ss}";
-                _lblState.ForeColor = health.IsDegraded ? Color.Orange : Color.FromArgb(217, 48, 37);
-                _btnMain.Text = "■ Stop && Save";
-                _btnMain.BackColor = Color.FromArgb(217, 48, 37);
-                _btnMain.Enabled = true;
-                _btnPauseResume.Text = "⏸ Pause";
-                _btnPauseResume.Enabled = true;
+                SetPill("Recording", Tone.Danger);
+                SetMainButton("Stop & save", ButtonKind.Strong, Glyphs.Stop, enabled: true);
+                SetPauseButton(paused: false, enabled: true);
                 _btnTestAudio.Enabled = false;
                 break;
 
             case RecorderState.Paused:
-                _lblState.Text = "⏸ Paused";
-                _lblState.ForeColor = Color.FromArgb(107, 107, 107);
-                _btnMain.Text = "■ Stop && Save";
-                _btnMain.BackColor = Color.FromArgb(217, 48, 37);
-                _btnMain.Enabled = true;
-                _btnPauseResume.Text = "▶ Resume";
-                _btnPauseResume.Enabled = true;
+                SetPill("Paused", Tone.Warning);
+                SetMainButton("Stop & save", ButtonKind.Strong, Glyphs.Stop, enabled: true);
+                SetPauseButton(paused: true, enabled: true);
                 _btnTestAudio.Enabled = false;
                 break;
 
             case RecorderState.Faulted:
-                _lblState.Text = "Not recording — retrying";
-                _lblState.ForeColor = Color.FromArgb(217, 48, 37);
-                _btnMain.Text = "● Retry Start";
-                _btnMain.BackColor = Color.FromArgb(30, 142, 62);
-                _btnMain.Enabled = true;
-                _btnPauseResume.Enabled = false;
-                _btnTestAudio.Enabled = true;
+                SetPill("Not recording — retrying", Tone.Danger);
+                SetMainButton("Retry start", ButtonKind.Record, Glyphs.Refresh, enabled: true);
+                SetPauseButton(paused: false, enabled: false);
+                _btnTestAudio.Enabled = !_isTestingAudio;
                 break;
 
             case RecorderState.Starting:
-                _lblState.Text = "Starting…";
-                _lblState.ForeColor = Color.FromArgb(30, 142, 62);
-                _btnMain.Text = "Starting…";
-                _btnMain.Enabled = false;
-                _btnPauseResume.Enabled = false;
+                SetPill("Starting…", Tone.Accent);
+                SetMainButton("Starting…", ButtonKind.Record, Glyphs.Record, enabled: false);
+                SetPauseButton(paused: false, enabled: false);
                 _btnTestAudio.Enabled = false;
                 break;
 
             case RecorderState.Saving:
             case RecorderState.Stopping:
-                _lblState.Text = "Saving…";
-                _lblState.ForeColor = Color.FromArgb(107, 107, 107);
-                _btnMain.Text = "Saving…";
-                _btnMain.Enabled = false;
-                _btnPauseResume.Enabled = false;
+                SetPill("Saving…", Tone.Neutral);
+                SetMainButton("Saving…", ButtonKind.Strong, Glyphs.Save, enabled: false);
+                SetPauseButton(paused: false, enabled: false);
                 _btnTestAudio.Enabled = false;
                 break;
 
             case RecorderState.Recovering:
-                _lblState.Text = "Recovering…";
-                _lblState.ForeColor = Color.Orange;
-                _btnMain.Enabled = false;
-                _btnPauseResume.Enabled = false;
+                SetPill("Recovering…", Tone.Warning);
+                SetMainButton("Recovering…", ButtonKind.Strong, Glyphs.Refresh, enabled: false);
+                SetPauseButton(paused: false, enabled: false);
                 _btnTestAudio.Enabled = false;
                 break;
 
-            case RecorderState.Idle:
             default:
-                _lblState.Text = "● Ready";
-                _lblState.ForeColor = Color.FromArgb(30, 142, 62);
-                if (!_isStartupComplete)
+                if (_isStartupComplete)
                 {
-                    _btnMain.Text = "Preparing…";
-                    _btnMain.BackColor = Color.FromArgb(107, 107, 107);
-                    _btnMain.Enabled = false;
+                    SetPill("Ready", Tone.Success);
+                    SetMainButton("Start recording", ButtonKind.Record, Glyphs.Record, enabled: true);
                 }
                 else
                 {
-                    _btnMain.Text = "● Start Recording";
-                    _btnMain.BackColor = Color.FromArgb(30, 142, 62);
-                    _btnMain.Enabled = true;
+                    SetPill("Preparing…", Tone.Neutral);
+                    SetMainButton("Preparing…", ButtonKind.Record, Glyphs.Record, enabled: false);
                 }
-                _btnPauseResume.Text = "⏸ Pause";
-                _btnPauseResume.Enabled = false;
+
+                SetPauseButton(paused: false, enabled: false);
                 _btnTestAudio.Enabled = !_isTestingAudio && _isStartupComplete;
                 break;
         }
 
-        if (health.DegradedWarnings.Count > 0)
-        {
-            _lblDegraded.Text = string.Join("; ", health.DegradedWarnings);
-        }
-        else
-        {
-            _lblDegraded.Text = string.Empty;
-        }
-
-        // Current file display
-        var hasCurrentFile = !string.IsNullOrEmpty(health.CurrentFilePath) && File.Exists(health.CurrentFilePath);
-        var hasSavedFile = GetLastSavedFilePath() != null;
-
-        if (!string.IsNullOrEmpty(health.CurrentFilePath))
-        {
-            var fileName = Path.GetFileName(health.CurrentFilePath);
-            var mb = health.CurrentFileBytes / (1024.0 * 1024.0);
-            _lblFile.Text = $"{fileName}\nSize: {mb:F1} MB";
-            _btnPlay.Enabled = hasCurrentFile || hasSavedFile;
-        }
-        else
-        {
-            _lblFile.Text = "Ready to record";
-            _btnPlay.Enabled = hasSavedFile;
-        }
-
-        // Audio devices and switch status
-        var audioStatus = _audioEngine.GetStatus();
-        var mic = audioStatus.ActiveDevices.FirstOrDefault(d => !d.IsLoopback);
-        var sys = audioStatus.ActiveDevices.FirstOrDefault(d => d.IsLoopback);
-
-        _lblMicName.Text = $"Mic: {Truncate(audioStatus.MicDisplayStatus, 22)}";
-        _toolTip.SetToolTip(_lblMicName, $"Mic: {audioStatus.MicDisplayStatus}");
-        _lblOutName.Text = $"System: {Truncate(audioStatus.SystemDisplayStatus, 22)}";
-        _toolTip.SetToolTip(_lblOutName, $"System: {audioStatus.SystemDisplayStatus}");
-        _lblAudioSwitch.Text = $"Last switch: {audioStatus.LastSwitchSummary}";
-        _toolTip.SetToolTip(_lblAudioSwitch, audioStatus.LastSwitchSummary);
-
-        // Storage line
-        if (_storageManager != null)
-        {
-            var status = _storageManager.GetStatus();
-            _pnlStorage.SuspendLayout();
-            _pnlStorage.Controls.Clear();
-
-            foreach (var loc in status.Locations)
-            {
-                var isLocActive = string.Equals(loc.Path, status.ActiveLocationPath, StringComparison.OrdinalIgnoreCase);
-                var freeGb = loc.AvailableFreeBytes / (1024.0 * 1024.0 * 1024.0);
-                var expanded = Environment.ExpandEnvironmentVariables(loc.Path);
-                var stateStr = loc.State switch
-                {
-                    StorageLocationState.Healthy => "Healthy",
-                    StorageLocationState.Low => "Low Space",
-                    StorageLocationState.Failed => "Failed",
-                    StorageLocationState.Disabled => "Disabled",
-                    _ => "Healthy"
-                };
-
-                var rowPanel = new FlowLayoutPanel
-                {
-                    AutoSize = true,
-                    FlowDirection = FlowDirection.LeftToRight,
-                    WrapContents = false,
-                    Margin = new Padding(0, 0, 0, 2)
-                };
-
-                var lbl = new Label
-                {
-                    AutoSize = true,
-                    Text = $"{(isLocActive ? "★ " : "  ")}{expanded} — {freeGb:F1} GB free · {stateStr}",
-                    ForeColor = isLocActive ? Color.Black : Color.DimGray,
-                    Font = new Font("Segoe UI", 8f, isLocActive ? FontStyle.Bold : FontStyle.Regular),
-                    UseMnemonic = false
-                };
-                rowPanel.Controls.Add(lbl);
-
-                long totalBytes = 0;
-                try
-                {
-                    var root = Path.GetPathRoot(expanded);
-                    if (!string.IsNullOrEmpty(root))
-                    {
-                        var drive = new DriveInfo(root);
-                        if (drive.IsReady) totalBytes = drive.TotalSize;
-                    }
-                }
-                catch
-                {
-                    // Ignore drive query failure
-                }
-
-                if (isLocActive && totalBytes > 0)
-                {
-                    var usedPercent = Math.Clamp((int)((1.0 - (loc.AvailableFreeBytes / (double)totalBytes)) * 100), 0, 100);
-                    var pbar = new ProgressBar
-                    {
-                        Width = 55,
-                        Height = 10,
-                        Minimum = 0,
-                        Maximum = 100,
-                        Value = usedPercent,
-                        Margin = new Padding(4, 3, 0, 0)
-                    };
-                    rowPanel.Controls.Add(pbar);
-                }
-
-                _pnlStorage.Controls.Add(rowPanel);
-            }
-            _pnlStorage.ResumeLayout();
-        }
-
-        // Video stats with color indicator
-        var targetFps = _settingsService.Current.Video.FrameRate;
-        var actualFps = health.ActualFps > 0 ? health.ActualFps : targetFps;
-        var speedColor = health.Speed > 0 && health.Speed < 0.97 ? "orange" : "normal";
-        _lblVideoStats.Text = $"Encoder: {health.EncoderProfile} · {actualFps:F0} fps (target {targetFps}) · Speed: {health.Speed:F2}x";
-        _lblVideoStats.ForeColor = speedColor == "orange" ? Color.DarkOrange : Color.Black;
+        _btnAddMarker.Enabled = health.State is RecorderState.Recording or RecorderState.Paused;
     }
 
-    private static string Truncate(string text, int max)
+    private void SetPill(string text, Tone tone)
     {
-        return text.Length <= max ? text : text[..max] + "…";
+        _pill.Text = text;
+        _pill.Tone = tone;
+    }
+
+    private void SetMainButton(string text, ButtonKind kind, char glyph, bool enabled)
+    {
+        _btnMain.Text = text;
+        _btnMain.Kind = kind;
+        _btnMain.Glyph = glyph;
+        _btnMain.GlyphColor = kind == ButtonKind.Strong && glyph == Glyphs.Stop ? Theme.Current.Danger : Color.Empty;
+        _btnMain.Enabled = enabled;
+    }
+
+    private void SetPauseButton(bool paused, bool enabled)
+    {
+        _btnPauseResume.Glyph = paused ? Glyphs.Play : Glyphs.Pause;
+        _btnPauseResume.AccessibleName = paused ? "Resume recording" : "Pause recording";
+        _btnPauseResume.Enabled = enabled;
+    }
+
+    private void ApplyDeviceStatus(TextLabel label, GlyphIcon icon, string status, char glyph, string role)
+    {
+        // Core reports "✔ Name", "✖ Reason" or "⟳ Retrying: reason"; show the text with a matching tone instead of symbols.
+        var text = status;
+        var tone = TextTone.Primary;
+        var iconTone = TextTone.Secondary;
+        if (status.StartsWith('✔'))
+        {
+            text = status[1..].Trim();
+        }
+        else if (status.StartsWith('✖'))
+        {
+            text = status[1..].Trim();
+            tone = TextTone.Tertiary;
+            iconTone = TextTone.Tertiary;
+        }
+        else if (status.StartsWith('⟳'))
+        {
+            text = status[1..].Trim();
+            tone = TextTone.Warning;
+            iconTone = TextTone.Warning;
+        }
+
+        label.Text = text;
+        label.Tone = tone;
+        icon.Glyph = glyph;
+        icon.Tone = iconTone;
+        _toolTip.SetToolTip(label, $"{role}: {text}");
+    }
+
+    private List<StorageMeterRow> BuildStorageRows(StorageStatus status)
+    {
+        var rows = new List<StorageMeterRow>(status.Locations.Count);
+        foreach (var location in status.Locations)
+        {
+            var isActive = string.Equals(location.Path, status.ActiveLocationPath, StringComparison.OrdinalIgnoreCase);
+            var expanded = Environment.ExpandEnvironmentVariables(location.Path);
+            var (stateText, tone) = location.State switch
+            {
+                StorageLocationState.Low => ("Low on space", Tone.Warning),
+                StorageLocationState.Failed => ("Unavailable — retrying", Tone.Danger),
+                StorageLocationState.Disabled => ("Disabled", Tone.Neutral),
+                _ => ("Healthy", Tone.Success)
+            };
+
+            if (isActive)
+            {
+                stateText = status.IsInEmergencyMode ? "Saving here · emergency mode" : $"Saving here · {stateText}";
+                if (status.IsInEmergencyMode)
+                {
+                    tone = Tone.Danger;
+                }
+            }
+
+            rows.Add(new StorageMeterRow(expanded, location.AvailableFreeBytes, GetDriveTotal(expanded), stateText, tone, isActive));
+        }
+
+        return rows;
+    }
+
+    private long GetDriveTotal(string path)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(path);
+            if (string.IsNullOrEmpty(root))
+            {
+                return 0;
+            }
+
+            if (_driveTotals.TryGetValue(root, out var cached))
+            {
+                return cached;
+            }
+
+            var drive = new DriveInfo(root);
+            var total = drive.IsReady ? drive.TotalSize : 0;
+            if (total > 0)
+            {
+                _driveTotals[root] = total;
+            }
+
+            return total;
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException)
+        {
+            Log.Debug(ex, "Could not query drive size for {Path}", path);
+            return 0;
+        }
     }
 
     private async Task OnMainButtonClickedAsync()
     {
         if (_controller.State is RecorderState.Recording or RecorderState.Paused)
         {
-            if (_settingsService.Current.General.ConfirmBeforeStop)
+            if (!RecordingPrompts.ConfirmStop(this, _settingsService))
             {
-                var confirm = MessageBox.Show(this, "Stop and save the recording?", "ScreenVault", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                if (confirm != DialogResult.Yes) return;
+                return;
             }
 
             await _controller.StopAsync().ConfigureAwait(true);
@@ -691,6 +833,13 @@ public sealed class StatusForm : Form
         if (!string.IsNullOrEmpty(path) && File.Exists(path))
         {
             Process.Start("explorer.exe", $"/select,\"{path}\"");
+            return;
+        }
+
+        var saved = GetLastSavedFilePath();
+        if (!string.IsNullOrEmpty(saved) && File.Exists(saved))
+        {
+            Process.Start("explorer.exe", $"/select,\"{saved}\"");
         }
     }
 
@@ -703,46 +852,53 @@ public sealed class StatusForm : Form
         }
         else
         {
-            MessageBox.Show(this, "Current recording part is not yet available on disk.", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            ModernDialog.Info(this, "Nothing to play yet", "The current part is not on disk yet. Try again in a few seconds.");
         }
     }
 
     private void PlayLastSavedFile()
     {
-        var latestFile = GetLastSavedFilePath();
+        var latestFile = GetLastSavedFilePath(forceRefresh: true);
         if (!string.IsNullOrEmpty(latestFile) && File.Exists(latestFile))
         {
             _playerLauncher.Launch(latestFile);
             return;
         }
 
-        MessageBox.Show(this, "No saved recordings found in storage locations.", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        ModernDialog.Info(this, "No saved recordings yet", "Recordings will appear here after you record and stop.");
     }
 
-    private string? GetLastSavedFilePath()
+    /// <summary>Most recent video in the primary location. Cached: scanning large folders every second is expensive.</summary>
+    private string? GetLastSavedFilePath(bool forceRefresh = false)
     {
+        if (!forceRefresh && DateTime.UtcNow - _lastSavedCheckUtc < TimeSpan.FromSeconds(15))
+        {
+            return _lastSavedFile;
+        }
+
+        _lastSavedCheckUtc = DateTime.UtcNow;
         try
         {
             var recordingsDir = _settingsService.Current.Storage.Locations.FirstOrDefault(l => l.Enabled)?.Path
                 ?? @"%USERPROFILE%\Videos\Screen Recordings";
             var expandedDir = Environment.ExpandEnvironmentVariables(recordingsDir);
 
-            if (Directory.Exists(expandedDir))
-            {
-                return Directory.EnumerateFiles(expandedDir, "*.*", SearchOption.AllDirectories)
+            _lastSavedFile = Directory.Exists(expandedDir)
+                ? Directory.EnumerateFiles(expandedDir, "*.*", SearchOption.AllDirectories)
                     .Where(f => f.EndsWith(".mkv", StringComparison.OrdinalIgnoreCase) ||
                                 f.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase) ||
                                 f.EndsWith(".ts", StringComparison.OrdinalIgnoreCase))
                     .OrderByDescending(File.GetLastWriteTimeUtc)
-                    .FirstOrDefault();
-            }
+                    .FirstOrDefault()
+                : null;
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
-            // Ignore storage scan error
+            Log.Debug(ex, "Could not scan for the last saved recording.");
+            _lastSavedFile = null;
         }
 
-        return null;
+        return _lastSavedFile;
     }
 
     private void OpenWithDialog()
@@ -750,7 +906,7 @@ public sealed class StatusForm : Form
         var path = _controller.Health.CurrentFilePath;
         if (string.IsNullOrEmpty(path) || !File.Exists(path))
         {
-            path = GetLastSavedFilePath();
+            path = GetLastSavedFilePath(forceRefresh: true);
         }
 
         if (!string.IsNullOrEmpty(path) && File.Exists(path))
@@ -759,7 +915,7 @@ public sealed class StatusForm : Form
         }
         else
         {
-            MessageBox.Show(this, "No playable video file available to open.", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            ModernDialog.Info(this, "No video to open", "There is no playable recording yet.");
         }
     }
 
@@ -786,42 +942,30 @@ public sealed class StatusForm : Form
     {
         _isTestingAudio = true;
         _btnTestAudio.Enabled = false;
-        _btnTestAudio.Text = "Recording 5s…";
+        _btnTestAudio.Text = "Listening… 5s";
 
         try
         {
             var memoryStream = new MemoryStream();
             using var capture = new WasapiCapture();
             var maxPeakSeen = -90f;
-            var isFloat = capture.WaveFormat.Encoding == NAudio.Wave.WaveFormatEncoding.IeeeFloat ||
+            var isFloat = capture.WaveFormat.Encoding == WaveFormatEncoding.IeeeFloat ||
                           capture.WaveFormat.BitsPerSample == 32;
 
             capture.DataAvailable += (_, args) =>
             {
                 memoryStream.Write(args.Buffer, 0, args.BytesRecorded);
-                if (isFloat)
+                var step = isFloat ? 4 : 2;
+                for (var i = 0; i <= args.BytesRecorded - step; i += step)
                 {
-                    for (var i = 0; i <= args.BytesRecorded - 4; i += 4)
+                    var sample = isFloat ? BitConverter.ToSingle(args.Buffer, i) : BitConverter.ToInt16(args.Buffer, i) / 32768f;
+                    var abs = MathF.Abs(sample);
+                    if (abs > 0.0001f)
                     {
-                        var sample = BitConverter.ToSingle(args.Buffer, i);
-                        var abs = MathF.Abs(sample);
-                        if (abs > 0.0001f)
+                        var db = 20f * MathF.Log10(abs);
+                        if (db > maxPeakSeen)
                         {
-                            var db = 20f * MathF.Log10(abs);
-                            if (db > maxPeakSeen) maxPeakSeen = db;
-                        }
-                    }
-                }
-                else
-                {
-                    for (var i = 0; i <= args.BytesRecorded - 2; i += 2)
-                    {
-                        var sample = BitConverter.ToInt16(args.Buffer, i) / 32768f;
-                        var abs = MathF.Abs(sample);
-                        if (abs > 0.0001f)
-                        {
-                            var db = 20f * MathF.Log10(abs);
-                            if (db > maxPeakSeen) maxPeakSeen = db;
+                            maxPeakSeen = db;
                         }
                     }
                 }
@@ -831,7 +975,7 @@ public sealed class StatusForm : Form
             await Task.Delay(5000);
             capture.StopRecording();
 
-            _btnTestAudio.Text = "Playing…";
+            _btnTestAudio.Text = "Playing back…";
             memoryStream.Position = 0;
             if (memoryStream.Length > 0)
             {
@@ -847,48 +991,25 @@ public sealed class StatusForm : Form
 
             if (maxPeakSeen < -50f)
             {
-                MessageBox.Show(this,
-                    "Microphone peak never exceeded -50 dB.\n\nPlease check your physical mic mute switch, Windows input device settings, or microphone privacy permissions (ms-settings:privacy-microphone).",
-                    "Mic Signal Low / Silent",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                ModernDialog.Warning(this,
+                    "Your microphone seems silent",
+                    "The level never rose above −50 dB. Check the mute switch on your headset, the input device in Windows Sound settings, and Settings → Privacy → Microphone.");
             }
             else
             {
-                MessageBox.Show(this, "Audio test completed successfully. Microphone signal verified.", "Test Passed", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                ModernDialog.Success(this, "Microphone works", "ScreenVault heard you clearly. You're ready to record.");
             }
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Audio test failed: {ex.Message}", "Test Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Log.Warning(ex, "Audio test failed.");
+            ModernDialog.Error(this, "Audio test failed", ex.Message);
         }
         finally
         {
             _isTestingAudio = false;
-            _btnTestAudio.Text = "Test Audio";
+            _btnTestAudio.Text = "Test audio";
             _btnTestAudio.Enabled = true;
         }
-    }
-
-    protected override void OnFormClosing(FormClosingEventArgs e)
-    {
-        if (e.CloseReason == CloseReason.UserClosing)
-        {
-            e.Cancel = true;
-            Hide();
-            return;
-        }
-        base.OnFormClosing(e);
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            _timer10Hz.Dispose();
-            _timer1Hz.Dispose();
-            _playMenu.Dispose();
-        }
-        base.Dispose(disposing);
     }
 }

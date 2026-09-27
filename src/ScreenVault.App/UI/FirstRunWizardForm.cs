@@ -1,108 +1,305 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Media;
 using ScreenVault.App.Platform;
+using ScreenVault.App.UI.Controls;
+using ScreenVault.App.UI.Theming;
 using ScreenVault.Core.Audio;
 using ScreenVault.Core.Settings;
 using Serilog;
 
 namespace ScreenVault.App.UI;
 
-public sealed class FirstRunWizardForm : Form
+/// <summary>Five-step setup wizard: welcome, storage, audio check, startup &amp; clean-up, summary.</summary>
+public sealed class FirstRunWizardForm : ModernForm
 {
+    private const int TotalSteps = 5;
+    private const int ContentWidth = 468;
+
+    private static readonly string[] StepTitles = ["Welcome", "Storage", "Audio check", "Startup & clean-up", "Finish"];
+
     private readonly ISettingsService _settingsService;
     private readonly IAudioEngine _audioEngine;
+    private readonly StepList _steps;
+    private readonly SurfacePanel[] _pages = new SurfacePanel[TotalSteps];
+    private readonly ModernButton _btnBack;
+    private readonly ModernButton _btnNext;
+    private readonly ModernButton _btnCancel;
+    private readonly System.Windows.Forms.Timer _vuTimer;
     private int _currentStep = 1;
-    private const int TotalSteps = 5;
 
-    private readonly Panel _panelContent;
-    private readonly Button _btnBack;
-    private readonly Button _btnNext;
-    private readonly Button _btnCancel;
-    private readonly Label _lblStepIndicator;
+    // Step 2
+    private readonly TextField _txtPrimaryStorage = new();
+    private readonly TextField _txtBackupStorage = new();
+    private readonly ModernProgressBar _barPrimary = new();
+    private readonly ModernProgressBar _barBackup = new();
+    private readonly TextLabel _lblPrimaryFree = new(string.Empty, Typography.Caption, TextTone.Secondary);
+    private readonly TextLabel _lblBackupFree = new(string.Empty, Typography.Caption, TextTone.Secondary);
+    private readonly TextLabel _lblStorageWarning = new(string.Empty, Typography.Caption, TextTone.Warning, wrap: true);
 
-    // Step 2 controls
-    private TextBox? _txtPrimaryStorage;
-    private TextBox? _txtBackupStorage;
+    // Step 3
+    private readonly VuMeterControl _vuMic = new() { AccessibleName = "Microphone level" };
+    private readonly VuMeterControl _vuOut = new() { AccessibleName = "System audio level" };
+    private readonly StatusPill _pillMic = new() { Text = "Listening…", Tone = Tone.Neutral };
+    private readonly StatusPill _pillOut = new() { Text = "Waiting…", Tone = Tone.Neutral };
+    private readonly CardPanel _privacyWarning = new() { AccentTone = Tone.Warning, ManualLayout = true, Visible = false };
+    private bool _micHeard;
+    private bool _outHeard;
 
-    // Step 3 controls
-    private VuMeterControl? _vuMic;
-    private VuMeterControl? _vuOut;
-    private System.Windows.Forms.Timer? _vuTimer;
+    // Step 4
+    private readonly ToggleSwitch _chkStartWithWindows = new();
+    private readonly ToggleSwitch _chkAutoStart = new();
+    private readonly ToggleSwitch _chkRetention = new();
+    private readonly NumberField _numRetentionDays = new() { Minimum = 1, Maximum = 365, Suffix = "days", Width = 130 };
+    private readonly CardPanel _startupCard = new() { Dividers = true, Padding = new Padding(0), Spacing = 0 };
 
-    // Step 4 controls
-    private CheckBox? _chkStartWithWindows;
-    private CheckBox? _chkAutoStart;
-    private CheckBox? _chkRetention;
-    private NumericUpDown? _numRetentionDays;
+    // Step 5
+    private readonly CardPanel _shortcutsCard = new() { Dividers = true, Padding = new Padding(0), Spacing = 0 };
 
     public FirstRunWizardForm(ISettingsService settingsService, IAudioEngine audioEngine)
     {
         _settingsService = settingsService ?? throw new ArgumentNullException(nameof(settingsService));
         _audioEngine = audioEngine ?? throw new ArgumentNullException(nameof(audioEngine));
 
-        Text = "ScreenVault Setup Wizard";
-        var appIcon = AppIcon.Get();
-        if (appIcon != null) Icon = appIcon;
-
+        Text = "ScreenVault Setup";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(540, 420);
+        ClientSize = new Size(780, 560);
 
-        _lblStepIndicator = new Label
+        // ── Left rail ────────────────────────────────────────────────────────────────
+        var rail = new SurfacePanel { Surface = SurfaceKind.Sidebar, Size = new Size(240, 560), Dock = DockStyle.Left };
+        var appIcon = AppIcon.Get();
+        if (appIcon != null)
         {
-            Location = new Point(20, 14),
-            Size = new Size(500, 20),
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(100, 100, 100),
-            UseMnemonic = false
-        };
+            using var large = new Icon(appIcon, 48, 48);
+            rail.Controls.Add(new PictureBox { Image = large.ToBitmap(), SizeMode = PictureBoxSizeMode.Zoom, Bounds = new Rectangle(28, 30, 44, 44) });
+        }
 
-        _panelContent = new Panel
+        rail.Controls.Add(new TextLabel("Set up ScreenVault", Typography.Title) { Location = new Point(26, 88) });
+        _steps = new StepList(StepTitles) { Bounds = new Rectangle(18, 136, 204, 240) };
+        rail.Controls.Add(_steps);
+        rail.Controls.Add(new TextLabel("You can change all of this later in Settings.", Typography.Caption, TextTone.Tertiary, wrap: true)
         {
-            Location = new Point(20, 40),
-            Size = new Size(500, 320)
-        };
+            Bounds = new Rectangle(26, 488, 190, 40)
+        });
 
-        _btnBack = new Button
-        {
-            Text = "◀ Back",
-            Location = new Point(260, 375),
-            Size = new Size(80, 30),
-            Enabled = false,
-            UseMnemonic = false
-        };
+        // ── Footer ───────────────────────────────────────────────────────────────────
+        var footer = new SurfacePanel { Size = new Size(540, 68), Dock = DockStyle.Bottom, TopDivider = true };
+        _btnCancel = new ModernButton("Cancel", ButtonKind.Subtle) { Bounds = new Rectangle(28, 18, 90, 32), DialogResult = DialogResult.Cancel };
+        _btnBack = new ModernButton("Back", ButtonKind.Secondary) { Bounds = new Rectangle(292, 18, 100, 32), Enabled = false };
         _btnBack.Click += (_, _) => NavigateStep(-1);
-
-        _btnNext = new Button
-        {
-            Text = "Next ▶",
-            Location = new Point(350, 375),
-            Size = new Size(80, 30),
-            UseMnemonic = false
-        };
+        _btnNext = new ModernButton("Next", ButtonKind.Primary, Glyphs.ChevronRight) { Bounds = new Rectangle(400, 18, 112, 32) };
         _btnNext.Click += (_, _) => NavigateStep(1);
+        footer.Controls.AddRange([_btnCancel, _btnBack, _btnNext]);
+        CancelButton = _btnCancel;
 
-        _btnCancel = new Button
+        // ── Pages ────────────────────────────────────────────────────────────────────
+        var host = new SurfacePanel { Size = new Size(540, 492), Dock = DockStyle.Fill };
+        _pages[0] = BuildWelcomePage();
+        _pages[1] = BuildStoragePage();
+        _pages[2] = BuildAudioPage();
+        _pages[3] = BuildStartupPage();
+        _pages[4] = BuildFinishPage();
+        foreach (var page in _pages)
         {
-            Text = "Cancel",
-            Location = new Point(440, 375),
-            Size = new Size(80, 30),
-            DialogResult = DialogResult.Cancel,
-            UseMnemonic = false
-        };
+            page.Size = new Size(540, 492);
+            page.Dock = DockStyle.Fill;
+            page.Visible = false;
+            host.Controls.Add(page);
+        }
 
-        Controls.AddRange([_lblStepIndicator, _panelContent, _btnBack, _btnNext, _btnCancel]);
+        Controls.Add(host);
+        Controls.Add(footer);
+        Controls.Add(rail);
+
+        _vuTimer = new System.Windows.Forms.Timer { Interval = 100 };
+        _vuTimer.Tick += (_, _) => UpdateAudioCheck();
+
+        ResumeLayout(false);
+        PerformLayout();
 
         ShowStep(1);
     }
 
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        StopVuTimer();
+        base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _vuTimer.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    // ── Pages ────────────────────────────────────────────────────────────────────────
+
+    private static SurfacePanel NewPage(string title, string subtitle)
+    {
+        var page = new SurfacePanel { Size = new Size(540, 492) };
+        page.Controls.Add(new TextLabel(title, Typography.Display) { Location = new Point(34, 30) });
+        page.Controls.Add(new TextLabel(subtitle, Typography.Body, TextTone.Secondary, wrap: true) { Bounds = new Rectangle(36, 74, ContentWidth, 44) });
+        return page;
+    }
+
+    private static SurfacePanel BuildWelcomePage()
+    {
+        var page = NewPage("Welcome to ScreenVault", "An always-on recorder for your screen, microphone and meeting audio that keeps going when devices change, apps crash or a drive fills up.");
+        page.Controls.Add(FeatureTile(Glyphs.Shield, Tone.Success, "Crash-proof by design", "Video reaches the disk every second. Even a power cut costs only a moment.", 140));
+        page.Controls.Add(FeatureTile(Glyphs.Record, Tone.Danger, "Always visible", "A red dot in the notification area shows when recording is on. There is no hidden mode.", 222));
+        page.Controls.Add(FeatureTile(Glyphs.Lock, Tone.Accent, "100% offline", "No accounts, uploads or telemetry. Recordings never leave your drives.", 304));
+        return page;
+    }
+
+    private static CardPanel FeatureTile(char glyph, Tone tone, string title, string description, int top)
+    {
+        var tile = new CardPanel { ManualLayout = true, Bounds = new Rectangle(36, top, ContentWidth, 72) };
+        tile.Controls.Add(new GlyphBadge { Glyph = glyph, Tone = tone, Bounds = new Rectangle(16, 16, 40, 40) });
+        tile.Controls.Add(new TextLabel(title, Typography.BodyStrong) { Location = new Point(70, 15) });
+        tile.Controls.Add(new TextLabel(description, Typography.Caption, TextTone.Secondary, wrap: true) { Bounds = new Rectangle(70, 36, ContentWidth - 86, 32) });
+        return tile;
+    }
+
+    private SurfacePanel BuildStoragePage()
+    {
+        var page = NewPage("Where should recordings go?", "If the first drive runs low, ScreenVault continues on the backup drive automatically — without a gap in the recording.");
+
+        var locations = _settingsService.Current.Storage.Locations;
+        _txtPrimaryStorage.Text = locations.Count > 0 ? locations[0].Path : @"%USERPROFILE%\Videos\Screen Recordings";
+        _txtBackupStorage.Text = locations.Count > 1 ? locations[1].Path : @"D:\ScreenVault Backup";
+        _txtBackupStorage.PlaceholderText = "Optional — a folder on another drive";
+
+        AddLocationEditor(page, "Primary folder", _txtPrimaryStorage, _barPrimary, _lblPrimaryFree, 136);
+        AddLocationEditor(page, "Backup folder (on a different drive)", _txtBackupStorage, _barBackup, _lblBackupFree, 250);
+        _lblStorageWarning.Bounds = new Rectangle(36, 364, ContentWidth, 40);
+        page.Controls.Add(_lblStorageWarning);
+
+        _txtPrimaryStorage.TextChanged += (_, _) => UpdateStorageInfo();
+        _txtBackupStorage.TextChanged += (_, _) => UpdateStorageInfo();
+        UpdateStorageInfo();
+        return page;
+    }
+
+    private void AddLocationEditor(Control page, string label, TextField field, ModernProgressBar bar, TextLabel freeLabel, int top)
+    {
+        page.Controls.Add(new TextLabel(label, Typography.BodyStrong) { Location = new Point(36, top) });
+        field.Bounds = new Rectangle(36, top + 26, 356, 32);
+        field.LeadingGlyph = Glyphs.Folder;
+        var browse = new ModernButton("Browse…", ButtonKind.Secondary) { Bounds = new Rectangle(400, top + 26, 104, 32) };
+        browse.Click += (_, _) => BrowseFolder(field);
+        bar.Bounds = new Rectangle(36, top + 68, ContentWidth, 6);
+        freeLabel.Location = new Point(34, top + 80);
+        page.Controls.AddRange([field, browse, bar, freeLabel]);
+    }
+
+    private SurfacePanel BuildAudioPage()
+    {
+        var page = NewPage("Check your audio", "Say something and play the test sound. Both meters should move — that's how you know meetings will be recorded with sound.");
+
+        page.Controls.Add(AudioCard(Glyphs.Microphone, "Microphone", "Say something — the bar should move.", _pillMic, _vuMic, 132));
+        page.Controls.Add(AudioCard(Glyphs.Volume, "System audio", "Play the test sound through your speakers or headset.", _pillOut, _vuOut, 240));
+
+        var btnChime = new ModernButton("Play test sound", ButtonKind.Secondary, Glyphs.Play) { Bounds = new Rectangle(36, 350, 150, 32) };
+        btnChime.Click += (_, _) =>
+        {
+            try
+            {
+                SystemSounds.Asterisk.Play();
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or TimeoutException)
+            {
+                Log.Debug(ex, "Could not play the test chime.");
+            }
+        };
+
+        var btnPrivacy = new ModernButton("Microphone privacy settings", ButtonKind.Subtle, Glyphs.Shield) { Bounds = new Rectangle(194, 350, 230, 32) };
+        btnPrivacy.Click += (_, _) => OpenMicPrivacySettings();
+
+        _privacyWarning.Bounds = new Rectangle(36, 396, ContentWidth, 56);
+        _privacyWarning.Controls.Add(new GlyphIcon { Glyph = Glyphs.Warning, Tone = TextTone.Warning, Bounds = new Rectangle(12, 18, 20, 20) });
+        _privacyWarning.Controls.Add(new TextLabel("Windows is blocking microphone access for desktop apps. Turn on \"Let desktop apps access your microphone\" in privacy settings.", Typography.Caption, TextTone.Warning, wrap: true)
+        {
+            Bounds = new Rectangle(40, 9, ContentWidth - 52, 40)
+        });
+
+        page.Controls.AddRange([btnChime, btnPrivacy, _privacyWarning]);
+        return page;
+    }
+
+    private static CardPanel AudioCard(char glyph, string title, string description, StatusPill pill, VuMeterControl meter, int top)
+    {
+        var card = new CardPanel { ManualLayout = true, Bounds = new Rectangle(36, top, ContentWidth, 96) };
+        card.Controls.Add(new GlyphBadge { Glyph = glyph, Tone = Tone.Accent, Bounds = new Rectangle(16, 16, 36, 36) });
+        card.Controls.Add(new TextLabel(title, Typography.BodyStrong) { Location = new Point(64, 15) });
+        card.Controls.Add(new TextLabel(description, Typography.Caption, TextTone.Secondary) { Location = new Point(64, 36) });
+        pill.Location = new Point(ContentWidth - 16 - 96, 16);
+        pill.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        card.Controls.Add(pill);
+        meter.Bounds = new Rectangle(64, 62, ContentWidth - 80, 20);
+        card.Controls.Add(meter);
+        return card;
+    }
+
+    private SurfacePanel BuildStartupPage()
+    {
+        var page = NewPage("Startup and clean-up", "Choose how ScreenVault starts and whether old recordings are removed to save space.");
+        var current = _settingsService.Current;
+        _chkStartWithWindows.Checked = current.General.StartWithWindows;
+        _chkAutoStart.Checked = current.General.StartRecordingOnLaunch;
+        _chkRetention.Checked = current.Storage.Retention.Enabled;
+        _numRetentionDays.Value = Math.Clamp(current.Storage.Retention.KeepDays, 1, 365);
+        _numRetentionDays.Enabled = _chkRetention.Checked;
+        _chkRetention.CheckedChanged += (_, _) => _numRetentionDays.Enabled = _chkRetention.Checked;
+
+        _startupCard.Bounds = new Rectangle(36, 132, ContentWidth, 260);
+        _startupCard.Controls.Add(new SettingRow("Start with Windows", "Open ScreenVault in the notification area when you sign in (recommended).", _chkStartWithWindows, Glyphs.Monitor));
+        _startupCard.Controls.Add(new SettingRow("Start recording automatically", "Begin recording as soon as ScreenVault starts.", _chkAutoStart, Glyphs.Record));
+        _startupCard.Controls.Add(new SettingRow("Delete old recordings", "Off by default. Protected recordings are never deleted.", _chkRetention, Glyphs.Delete));
+        _startupCard.Controls.Add(new SettingRow("Keep recordings for", null, _numRetentionDays));
+        page.Controls.Add(_startupCard);
+        return page;
+    }
+
+    private SurfacePanel BuildFinishPage()
+    {
+        var page = new SurfacePanel { Size = new Size(540, 492) };
+        page.Controls.Add(new GlyphBadge { Glyph = Glyphs.CheckMark, Tone = Tone.Success, Filled = true, Bounds = new Rectangle(36, 34, 52, 52) });
+        page.Controls.Add(new TextLabel("You're all set", Typography.Display) { Location = new Point(34, 100) });
+        page.Controls.Add(new TextLabel("Click Finish to save. ScreenVault lives in the notification area next to the clock — click its icon at any time to see what's happening.", Typography.Body, TextTone.Secondary, wrap: true)
+        {
+            Bounds = new Rectangle(36, 144, ContentWidth, 44)
+        });
+        page.Controls.Add(new TextLabel("Handy shortcuts", Typography.BodyStrong) { Location = new Point(36, 204) });
+
+        var hotkeys = _settingsService.Current.Hotkeys;
+        _shortcutsCard.Bounds = new Rectangle(36, 230, ContentWidth, 224);
+        _shortcutsCard.Controls.Add(ShortcutRow("Start / stop & save", hotkeys.StartStop, Glyphs.Record));
+        _shortcutsCard.Controls.Add(ShortcutRow("Add a marker", hotkeys.AddMarker, Glyphs.Flag));
+        _shortcutsCard.Controls.Add(ShortcutRow("Pause / resume", hotkeys.PauseResume, Glyphs.Pause));
+        _shortcutsCard.Controls.Add(ShortcutRow("Show the status window", hotkeys.ShowStatus, Glyphs.Monitor));
+        page.Controls.Add(_shortcutsCard);
+        return page;
+
+        static SettingRow ShortcutRow(string title, string hotkey, char glyph) =>
+            new(title, null, new HotkeyField { ReadOnly = true, Hotkey = hotkey, Size = new Size(230, 28) }, glyph);
+    }
+
+    // ── Navigation ───────────────────────────────────────────────────────────────────
+
     private void NavigateStep(int delta)
     {
         var target = _currentStep + delta;
-        if (target < 1) return;
+        if (target < 1)
+        {
+            return;
+        }
 
         if (target > TotalSteps)
         {
@@ -116,254 +313,172 @@ public sealed class FirstRunWizardForm : Form
     private void ShowStep(int step)
     {
         _currentStep = step;
-        _lblStepIndicator.Text = $"Step {step} of {TotalSteps}";
+        _steps.Current = step - 1;
         _btnBack.Enabled = step > 1;
-        _btnNext.Text = step == TotalSteps ? "Finish" : "Next ▶";
+        _btnNext.Text = step == TotalSteps ? "Finish" : "Next";
+        _btnNext.Glyph = step == TotalSteps ? Glyphs.CheckMark : Glyphs.ChevronRight;
 
-        _panelContent.Controls.Clear();
         StopVuTimer();
+        for (var i = 0; i < _pages.Length; i++)
+        {
+            _pages[i].Visible = i == step - 1;
+        }
 
         switch (step)
         {
-            case 1:
-                BuildWelcomeStep();
-                break;
-            case 2:
-                BuildStorageStep();
-                break;
             case 3:
-                BuildAudioCheckStep();
+                _privacyWarning.Visible = !MicPrivacyChecker.IsMicrophoneAccessAllowed();
+                _audioEngine.SetMonitoring(true);
+                _vuTimer.Start();
                 break;
             case 4:
-                BuildStartupRetentionStep();
+                FitCard(_startupCard);
                 break;
             case 5:
-                BuildFinishStep();
+                FitCard(_shortcutsCard);
                 break;
+        }
+
+        _btnNext.Focus();
+    }
+
+    private static void FitCard(CardPanel card)
+    {
+        var preferred = card.GetPreferredSize(new Size(card.Width, 0)).Height;
+        if (preferred > 0)
+        {
+            card.Height = preferred;
         }
     }
 
-    private void BuildWelcomeStep()
+    private void StopVuTimer()
     {
-        var title = new Label
-        {
-            Text = "Welcome to ScreenVault",
-            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
-            Location = new Point(0, 10),
-            Size = new Size(500, 32)
-        };
-
-        var desc = new Label
-        {
-            Text = "ScreenVault is an always-on, crash-proof recorder that captures your screen, microphone, and meeting audio directly to your drive.\n\n" +
-                   "Key principles:\n" +
-                   "• Crash-Proof: Video is written in 1-second durable increments. If your PC crashes or loses power, your recording is safe.\n" +
-                   "• Always Visible: A red dot in your system tray means recording is active. There is no hidden mode.\n" +
-                   "• 100% Offline: ScreenVault never makes network requests or uploads your data.\n\n" +
-                   "Let's configure your storage, test your audio, and get started in just a few clicks.",
-            Font = new Font("Segoe UI", 9.5f),
-            Location = new Point(0, 50),
-            Size = new Size(500, 240)
-        };
-
-        _panelContent.Controls.AddRange([title, desc]);
+        _vuTimer.Stop();
+        _audioEngine.SetMonitoring(false);
     }
 
-    private void BuildStorageStep()
+    private void UpdateAudioCheck()
     {
-        var title = new Label
+        try
         {
-            Text = "Storage Locations",
-            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-            Location = new Point(0, 10),
-            Size = new Size(500, 26)
-        };
+            var status = _audioEngine.GetStatus();
+            var mic = status.ActiveDevices.FirstOrDefault(d => !d.IsLoopback);
+            var sys = status.ActiveDevices.FirstOrDefault(d => d.IsLoopback);
+            _vuMic.SetLevels(mic?.PeakDb ?? -90f, mic?.PeakDb ?? -90f, mic?.RmsDb ?? -90f, mic?.RmsDb ?? -90f);
+            _vuOut.SetLevels(sys?.PeakDb ?? -90f, sys?.PeakDb ?? -90f, sys?.RmsDb ?? -90f, sys?.RmsDb ?? -90f);
 
-        var desc = new Label
+            if (!_micHeard && (mic?.PeakDb ?? -90f) > -45f)
+            {
+                _micHeard = true;
+                _pillMic.Text = "Working";
+                _pillMic.Tone = Tone.Success;
+            }
+            else if (!_micHeard && mic == null)
+            {
+                _pillMic.Text = "No microphone";
+                _pillMic.Tone = Tone.Warning;
+            }
+
+            if (!_outHeard && (sys?.PeakDb ?? -90f) > -50f)
+            {
+                _outHeard = true;
+                _pillOut.Text = "Working";
+                _pillOut.Tone = Tone.Success;
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
         {
-            Text = "Choose where your recordings will be saved. If your primary drive runs low on space, ScreenVault automatically fails over to your backup location.",
-            Font = new Font("Segoe UI", 9.5f),
-            Location = new Point(0, 40),
-            Size = new Size(500, 40)
-        };
-
-        var currentLocs = _settingsService.Current.Storage.Locations;
-        var primaryPath = currentLocs.Count > 0 ? currentLocs[0].Path : @"%USERPROFILE%\Videos\Screen Recordings";
-        var backupPath = currentLocs.Count > 1 ? currentLocs[1].Path : @"D:\ScreenVault Backup";
-
-        var lblPrimary = new Label { Text = "Primary Storage Path:", Location = new Point(0, 95), AutoSize = true, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
-        _txtPrimaryStorage = new TextBox { Text = primaryPath, Location = new Point(0, 118), Width = 400 };
-        var btnBrowsePrimary = new Button { Text = "Browse…", Location = new Point(410, 116), Width = 80, Height = 26 };
-        btnBrowsePrimary.Click += (_, _) => BrowseFolder(_txtPrimaryStorage);
-
-        var lblBackup = new Label { Text = "Backup Storage Path (Failover):", Location = new Point(0, 160), AutoSize = true, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
-        _txtBackupStorage = new TextBox { Text = backupPath, Location = new Point(0, 183), Width = 400 };
-        var btnBrowseBackup = new Button { Text = "Browse…", Location = new Point(410, 181), Width = 80, Height = 26 };
-        btnBrowseBackup.Click += (_, _) => BrowseFolder(_txtBackupStorage);
-
-        _panelContent.Controls.AddRange([title, desc, lblPrimary, _txtPrimaryStorage, btnBrowsePrimary, lblBackup, _txtBackupStorage, btnBrowseBackup]);
+            Log.Debug(ex, "Audio check update failed.");
+        }
     }
 
-    private void BrowseFolder(TextBox target)
+    private void UpdateStorageInfo()
     {
-        using var fbd = new FolderBrowserDialog();
+        var primary = DescribeDrive(_txtPrimaryStorage.Text, _barPrimary, _lblPrimaryFree);
+        var backup = DescribeDrive(_txtBackupStorage.Text, _barBackup, _lblBackupFree);
+
+        if (string.IsNullOrWhiteSpace(_txtBackupStorage.Text))
+        {
+            _lblStorageWarning.Text = "Without a backup folder, recording stops if the primary drive fills up.";
+        }
+        else if (primary != null && backup != null && string.Equals(primary, backup, StringComparison.OrdinalIgnoreCase))
+        {
+            _lblStorageWarning.Text = "Both folders are on the same drive, so the backup won't help when that drive fills up. Pick a folder on another drive if you have one.";
+        }
+        else
+        {
+            _lblStorageWarning.Text = string.Empty;
+        }
+    }
+
+    /// <summary>Updates a usage bar and caption; returns the drive root or null.</summary>
+    private static string? DescribeDrive(string rawPath, ModernProgressBar bar, TextLabel label)
+    {
+        bar.Value = 0;
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
+            label.Text = "Not set";
+            return null;
+        }
+
+        try
+        {
+            var expanded = Environment.ExpandEnvironmentVariables(rawPath.Trim());
+            var root = Path.GetPathRoot(expanded);
+            if (string.IsNullOrEmpty(root))
+            {
+                label.Text = "Enter a full path, like D:\\Recordings";
+                return null;
+            }
+
+            if (root.StartsWith(@"\\", StringComparison.Ordinal))
+            {
+                label.Text = "Network folder — may disconnect during a recording";
+                label.Tone = TextTone.Warning;
+                return root;
+            }
+
+            var drive = new DriveInfo(root);
+            if (!drive.IsReady)
+            {
+                label.Text = $"Drive {root} is not available";
+                label.Tone = TextTone.Warning;
+                return root;
+            }
+
+            var usedFraction = 1d - (drive.AvailableFreeSpace / (double)drive.TotalSize);
+            bar.Value = (int)Math.Round(usedFraction * 100);
+            bar.Tone = drive.AvailableFreeSpace < 10L * 1024 * 1024 * 1024 ? Tone.Warning : Tone.Accent;
+            label.Tone = drive.AvailableFreeSpace < 10L * 1024 * 1024 * 1024 ? TextTone.Warning : TextTone.Secondary;
+            label.Text = string.Create(CultureInfo.CurrentCulture, $"{StorageMeterList.FormatBytes(drive.AvailableFreeSpace)} free of {StorageMeterList.FormatBytes(drive.TotalSize)} on {root.TrimEnd('\\')}");
+            return root;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            label.Text = "This path doesn't look valid";
+            label.Tone = TextTone.Warning;
+            return null;
+        }
+    }
+
+    private void BrowseFolder(TextField target)
+    {
+        using var fbd = new FolderBrowserDialog { UseDescriptionForTitle = true, Description = "Choose a folder for recordings" };
         if (fbd.ShowDialog(this) == DialogResult.OK)
         {
             target.Text = fbd.SelectedPath;
         }
     }
 
-    private void BuildAudioCheckStep()
+    private static void OpenMicPrivacySettings()
     {
-        var title = new Label
+        try
         {
-            Text = "Audio Verification",
-            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-            Location = new Point(0, 5),
-            Size = new Size(500, 24)
-        };
-
-        var desc = new Label
+            Process.Start(new ProcessStartInfo("ms-settings:privacy-microphone") { UseShellExecute = true });
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
         {
-            Text = "Speak into your microphone and play a test chime to verify both audio streams are alive.",
-            Font = new Font("Segoe UI", 9f),
-            Location = new Point(0, 32),
-            Size = new Size(500, 20)
-        };
-
-        var lblMic = new Label { Text = "Microphone (Say something):", Location = new Point(0, 60), AutoSize = true, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
-        _vuMic = new VuMeterControl { Location = new Point(0, 82), Size = new Size(490, 24) };
-
-        var lblOut = new Label { Text = "System Audio (Speakers / Headphones):", Location = new Point(0, 120), AutoSize = true, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
-        _vuOut = new VuMeterControl { Location = new Point(0, 142), Size = new Size(490, 24) };
-
-        var btnTestChime = new Button
-        {
-            Text = "▶ Play Test Chime",
-            Location = new Point(0, 180),
-            Size = new Size(140, 30)
-        };
-        btnTestChime.Click += (_, _) =>
-        {
-            try { SystemSounds.Asterisk.Play(); } catch { }
-        };
-
-        var btnPrivacy = new Button
-        {
-            Text = "Windows Mic Privacy Settings…",
-            Location = new Point(155, 180),
-            Size = new Size(210, 30)
-        };
-        btnPrivacy.Click += (_, _) =>
-        {
-            try { Process.Start(new ProcessStartInfo("ms-settings:privacy-microphone") { UseShellExecute = true }); } catch { }
-        };
-
-        _panelContent.Controls.AddRange([title, desc, lblMic, _vuMic, lblOut, _vuOut, btnTestChime, btnPrivacy]);
-
-        // Start live VU timer at 10 Hz
-        _vuTimer = new System.Windows.Forms.Timer { Interval = 100 };
-        _vuTimer.Tick += (_, _) =>
-        {
-            try
-            {
-                var status = _audioEngine.GetStatus();
-                var mic = status.ActiveDevices.FirstOrDefault(d => !d.IsLoopback);
-                var sys = status.ActiveDevices.FirstOrDefault(d => d.IsLoopback);
-                _vuMic?.SetLevels(mic?.PeakDb ?? -90f, mic?.PeakDb ?? -90f, mic?.RmsDb ?? -90f, mic?.RmsDb ?? -90f);
-                _vuOut?.SetLevels(sys?.PeakDb ?? -90f, sys?.PeakDb ?? -90f, sys?.RmsDb ?? -90f, sys?.RmsDb ?? -90f);
-            }
-            catch
-            {
-                // Ignore
-            }
-        };
-        _audioEngine.SetMonitoring(true);
-        _vuTimer.Start();
-    }
-
-    private void BuildStartupRetentionStep()
-    {
-        var title = new Label
-        {
-            Text = "Startup && Retention",
-            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-            Location = new Point(0, 10),
-            Size = new Size(500, 26),
-            UseMnemonic = false
-        };
-
-        _chkStartWithWindows = new CheckBox
-        {
-            Text = "Start ScreenVault automatically when Windows starts (Recommended)",
-            Location = new Point(0, 48),
-            Size = new Size(490, 24),
-            Checked = _settingsService.Current.General.StartWithWindows,
-            UseMnemonic = false
-        };
-
-        _chkAutoStart = new CheckBox
-        {
-            Text = "Start recording immediately on launch",
-            Location = new Point(0, 80),
-            Size = new Size(490, 24),
-            Checked = _settingsService.Current.General.StartRecordingOnLaunch
-        };
-
-        _chkRetention = new CheckBox
-        {
-            Text = "Enable automatic cleanup of old recordings",
-            Location = new Point(0, 120),
-            Size = new Size(490, 24),
-            Checked = _settingsService.Current.Storage.Retention.Enabled
-        };
-
-        var lblKeep = new Label { Text = "Keep recordings for (days):", Location = new Point(24, 155), AutoSize = true };
-        _numRetentionDays = new NumericUpDown
-        {
-            Location = new Point(190, 153),
-            Width = 70,
-            Minimum = 1,
-            Maximum = 365,
-            Value = Math.Max(1, _settingsService.Current.Storage.Retention.KeepDays)
-        };
-
-        _panelContent.Controls.AddRange([title, _chkStartWithWindows, _chkAutoStart, _chkRetention, lblKeep, _numRetentionDays]);
-    }
-
-    private void BuildFinishStep()
-    {
-        var title = new Label
-        {
-            Text = "You're Ready to Record!",
-            Font = new Font("Segoe UI", 14f, FontStyle.Bold),
-            Location = new Point(0, 10),
-            Size = new Size(500, 32)
-        };
-
-        var desc = new Label
-        {
-            Text = "Configuration is complete!\n\n" +
-                   "• Hotkey Ctrl+Alt+Shift+M: Add a meeting marker note.\n" +
-                   "• Hotkey Ctrl+Alt+Shift+P: Pause or resume recording.\n" +
-                   "• Hotkey Ctrl+Alt+Shift+S: Toggle the Status window.\n\n" +
-                   "Click 'Finish' to save your settings and begin recording.",
-            Font = new Font("Segoe UI", 10f),
-            Location = new Point(0, 60),
-            Size = new Size(500, 200)
-        };
-
-        _panelContent.Controls.AddRange([title, desc]);
-    }
-
-    private void StopVuTimer()
-    {
-        _audioEngine?.SetMonitoring(false);
-        if (_vuTimer != null)
-        {
-            _vuTimer.Stop();
-            _vuTimer.Dispose();
-            _vuTimer = null;
+            Log.Debug(ex, "Could not open microphone privacy settings.");
         }
     }
 
@@ -373,15 +488,12 @@ public sealed class FirstRunWizardForm : Form
         {
             var settings = _settingsService.Current;
 
-            if (_txtPrimaryStorage != null && !string.IsNullOrWhiteSpace(_txtPrimaryStorage.Text))
+            if (!string.IsNullOrWhiteSpace(_txtPrimaryStorage.Text) && settings.Storage.Locations.Count > 0)
             {
-                if (settings.Storage.Locations.Count > 0)
-                {
-                    settings.Storage.Locations[0].Path = _txtPrimaryStorage.Text.Trim();
-                }
+                settings.Storage.Locations[0].Path = _txtPrimaryStorage.Text.Trim();
             }
 
-            if (_txtBackupStorage != null && !string.IsNullOrWhiteSpace(_txtBackupStorage.Text))
+            if (!string.IsNullOrWhiteSpace(_txtBackupStorage.Text))
             {
                 if (settings.Storage.Locations.Count > 1)
                 {
@@ -398,26 +510,19 @@ public sealed class FirstRunWizardForm : Form
                 }
             }
 
-            if (_chkAutoStart != null)
+            settings.General.StartRecordingOnLaunch = _chkAutoStart.Checked;
+            settings.General.StartWithWindows = _chkStartWithWindows.Checked;
+            try
             {
-                settings.General.StartRecordingOnLaunch = _chkAutoStart.Checked;
+                StartWithWindows.SetEnabled(settings.General.StartWithWindows, settings.General.StartRecordingOnLaunch);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not update the Start with Windows registration.");
             }
 
-            if (_chkStartWithWindows != null)
-            {
-                settings.General.StartWithWindows = _chkStartWithWindows.Checked;
-                try { StartWithWindows.SetEnabled(settings.General.StartWithWindows, settings.General.StartRecordingOnLaunch); } catch { }
-            }
-
-            if (_chkRetention != null)
-            {
-                settings.Storage.Retention.Enabled = _chkRetention.Checked;
-            }
-
-            if (_numRetentionDays != null)
-            {
-                settings.Storage.Retention.KeepDays = (int)_numRetentionDays.Value;
-            }
+            settings.Storage.Retention.Enabled = _chkRetention.Checked;
+            settings.Storage.Retention.KeepDays = (int)_numRetentionDays.Value;
 
             _settingsService.Save(settings);
             DialogResult = DialogResult.OK;
@@ -426,13 +531,93 @@ public sealed class FirstRunWizardForm : Form
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to save wizard settings.");
-            MessageBox.Show(this, "Could not save settings: " + ex.Message, "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            ModernDialog.Error(this, "Could not save settings", ex.Message);
         }
     }
 
-    protected override void OnFormClosing(FormClosingEventArgs e)
+    /// <summary>Vertical list of wizard steps: done (check), current (filled), upcoming (outline).</summary>
+    private sealed class StepList : Control, IThemeAware
     {
-        StopVuTimer();
-        base.OnFormClosing(e);
+        private readonly string[] _titles;
+        private int _current;
+
+        public StepList(string[] titles)
+        {
+            _titles = titles;
+            SetStyle(
+                ControlStyles.UserPaint |
+                ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.ResizeRedraw |
+                ControlStyles.SupportsTransparentBackColor,
+                true);
+            SetStyle(ControlStyles.Selectable, false);
+            TabStop = false;
+            Font = Typography.Body;
+            AccessibleRole = AccessibleRole.ProgressBar;
+        }
+
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public int Current
+        {
+            get => _current;
+            set
+            {
+                _current = value;
+                AccessibleName = $"Step {value + 1} of {_titles.Length}: {_titles[value]}";
+                Invalidate();
+            }
+        }
+
+        public void ApplyTheme() => Invalidate();
+
+        protected override void OnPaintBackground(PaintEventArgs pevent)
+        {
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            var p = Theme.Current;
+            g.Clear(Draw.ParentBackground(this));
+            Draw.PrepareHighQuality(g);
+
+            var scale = Draw.Scale(this);
+            var rowHeight = 44 * scale;
+            var circle = 26 * scale;
+            for (var i = 0; i < _titles.Length; i++)
+            {
+                var top = i * rowHeight;
+                var dot = new RectangleF(8 * scale, top + ((rowHeight - circle) / 2f), circle, circle);
+
+                if (i < _titles.Length - 1)
+                {
+                    using var pen = new Pen(i < _current ? p.Accent : p.Border, Math.Max(1f, 2f * scale));
+                    g.DrawLine(pen, dot.X + (circle / 2f), dot.Bottom + (3 * scale), dot.X + (circle / 2f), top + rowHeight + ((rowHeight - circle) / 2f) - (3 * scale));
+                }
+
+                var done = i < _current;
+                var active = i == _current;
+                if (done || active)
+                {
+                    Draw.FillCircle(g, p.Accent, dot);
+                }
+                else
+                {
+                    Draw.FillCircle(g, p.Sidebar, dot);
+                    using var pen = new Pen(p.BorderStrong, Math.Max(1f, 1.5f * scale));
+                    g.DrawEllipse(pen, dot);
+                }
+
+                var label = done && Glyphs.Available ? Glyphs.CheckMark.ToString() : (i + 1).ToString(CultureInfo.InvariantCulture);
+                var labelFont = done && Glyphs.Available ? Glyphs.GetFont(8f)! : Typography.CaptionStrong;
+                TextRenderer.DrawText(g, label, labelFont, Rectangle.Round(dot), done || active ? p.OnAccent : p.TextSecondary,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+
+                var textRect = new Rectangle((int)(dot.Right + (12 * scale)), (int)top, Width - (int)(dot.Right + (12 * scale)), (int)rowHeight);
+                TextRenderer.DrawText(g, _titles[i], active ? Typography.BodyStrong : Font, textRect, active ? p.Text : done ? p.TextSecondary : p.TextTertiary,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+            }
+        }
     }
 }

@@ -107,6 +107,9 @@ internal static class Program
                 settingsService.Current.Video.FrameRate,
                 settingsService.Current.Storage.SplitMinutes);
 
+            // 7a. Light/dark palette for all windows (follows Windows unless overridden in Settings)
+            UI.Theming.Theme.Initialize(settingsService.Current.General.Theme);
+
             // 7. Run tray context
             Application.Run(new TrayApplicationContext(cli, settingsService));
             return 0;

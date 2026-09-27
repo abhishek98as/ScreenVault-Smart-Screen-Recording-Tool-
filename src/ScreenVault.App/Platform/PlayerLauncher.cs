@@ -86,7 +86,7 @@ public sealed class PlayerLauncher
         if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
         {
             Log.Warning("PlayerLauncher: file does not exist: {Path}", filePath);
-            MessageBox.Show($"File does not exist:\n{filePath}", "Cannot Play File", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            UI.ModernDialog.Warning(null, "Can't play this file", $"The file no longer exists:\n{filePath}");
             return false;
         }
 
@@ -96,7 +96,7 @@ public sealed class PlayerLauncher
             var msg = "No video player found. Install VLC (free) or choose a player in Settings → Advanced.\n\n" +
                       "(Note: .ts recording parts are not opened with system default to avoid opening code editors).";
             Log.Warning("PlayerLauncher: {Msg}", msg);
-            MessageBox.Show(msg, "No Video Player Available", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            UI.ModernDialog.Warning(null, "No video player available", msg);
             return false;
         }
 
@@ -159,7 +159,7 @@ public sealed class PlayerLauncher
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to launch video player for {Path}", filePath);
-            MessageBox.Show($"Failed to launch player:\n{ex.Message}", "Playback Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            UI.ModernDialog.Error(null, "Couldn't start the video player", ex.Message);
             return false;
         }
     }
