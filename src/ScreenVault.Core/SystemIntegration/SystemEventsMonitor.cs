@@ -9,6 +9,10 @@ public sealed class SystemEventsMonitor : IDisposable
     private readonly RecordingController _controller;
     private bool _isDisposed;
 
+    // Set when a system suspend paused a recording, so waking up resumes only that recording
+    // (never starts one the user didn't have running, never undoes a manual pause).
+    private volatile bool _pausedForSuspend;
+
     public SystemEventsMonitor(RecordingController controller)
     {
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -32,7 +36,13 @@ public sealed class SystemEventsMonitor : IDisposable
         Log.Information("Windows PowerModeChanged: {Mode}", e.Mode);
         if (e.Mode == PowerModes.Suspend)
         {
+            if (_controller.Desired != DesiredState.Recording)
+            {
+                return;
+            }
+
             // Suspend PC
+            _pausedForSuspend = true;
             Task.Run(async () =>
             {
                 try
@@ -47,6 +57,13 @@ public sealed class SystemEventsMonitor : IDisposable
         }
         else if (e.Mode == PowerModes.Resume)
         {
+            if (!_pausedForSuspend)
+            {
+                return;
+            }
+
+            _pausedForSuspend = false;
+
             // Resume PC: wait 3 seconds for audio stack and monitors to re-enumerate
             Task.Run(async () =>
             {
@@ -67,7 +84,20 @@ public sealed class SystemEventsMonitor : IDisposable
     private void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
     {
         Log.Information("Windows SessionSwitch: {Reason}", e.Reason);
-        _controller.AddMarker($"SessionSwitch: {e.Reason}", kind: "System");
+        if (_controller.State is RecorderState.Recording or RecorderState.Paused)
+        {
+            var label = e.Reason switch
+            {
+                SessionSwitchReason.SessionLock => "Screen locked",
+                SessionSwitchReason.SessionUnlock => "Screen unlocked",
+                SessionSwitchReason.RemoteConnect => "Remote desktop connected",
+                SessionSwitchReason.RemoteDisconnect => "Remote desktop disconnected",
+                SessionSwitchReason.ConsoleConnect => "Switched to this session",
+                SessionSwitchReason.ConsoleDisconnect => "Switched away from this session",
+                _ => $"Session change: {e.Reason}"
+            };
+            _controller.AddMarker(label, kind: "System");
+        }
     }
 
     private void OnDisplaySettingsChanged(object? sender, EventArgs e)

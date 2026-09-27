@@ -6,10 +6,15 @@ namespace ScreenVault.Core.Sessions;
 
 public interface IMarkerService
 {
-    void SetActiveSession(SessionManifest manifest, string? metadataBackupDir = null);
+    /// <param name="recordedSecondsProvider">
+    /// Returns the recorded time so far (paused time excluded). Marker offsets use it so they line
+    /// up with the video; without it the wall-clock time since the session started is used.
+    /// </param>
+    void SetActiveSession(SessionManifest manifest, string? metadataBackupDir = null, Func<double>? recordedSecondsProvider = null);
     void ClearActiveSession();
     MarkerEntry AddMarker(string note, string kind = "User");
     void AddEvent(string type, string detail);
+    bool HasActiveSession => false;
     event EventHandler<MarkerEntry>? MarkerAdded;
 }
 
@@ -22,6 +27,7 @@ public sealed class MarkerService : IMarkerService
 
     private SessionManifest? _activeManifest;
     private string? _metadataBackupDir;
+    private Func<double>? _recordedSecondsProvider;
 
     public event EventHandler<MarkerEntry>? MarkerAdded;
 
@@ -32,12 +38,24 @@ public sealed class MarkerService : IMarkerService
         _fileSystem = fileSystem ?? new FileSystem();
     }
 
-    public void SetActiveSession(SessionManifest manifest, string? metadataBackupDir = null)
+    public bool HasActiveSession
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _activeManifest != null;
+            }
+        }
+    }
+
+    public void SetActiveSession(SessionManifest manifest, string? metadataBackupDir = null, Func<double>? recordedSecondsProvider = null)
     {
         lock (_lock)
         {
             _activeManifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
             _metadataBackupDir = metadataBackupDir;
+            _recordedSecondsProvider = recordedSecondsProvider;
         }
     }
 
@@ -47,6 +65,7 @@ public sealed class MarkerService : IMarkerService
         {
             _activeManifest = null;
             _metadataBackupDir = null;
+            _recordedSecondsProvider = null;
         }
     }
 
@@ -61,21 +80,28 @@ public sealed class MarkerService : IMarkerService
         lock (_lock)
         {
             var nowUtc = _clock.UtcNow;
-            var offsetSec = _activeManifest != null
-                ? Math.Max(0.0, (nowUtc - _activeManifest.StartedAtUtc).TotalSeconds)
-                : 0.0;
+            var offsetSec = 0.0;
+            if (_activeManifest != null)
+            {
+                offsetSec = _recordedSecondsProvider != null
+                    ? _recordedSecondsProvider()
+                    : (nowUtc - _activeManifest.StartedAtUtc).TotalSeconds;
+            }
 
             marker = new MarkerEntry
             {
                 AtUtc = nowUtc,
-                OffsetSec = Math.Round(offsetSec, 2),
+                OffsetSec = Math.Round(Math.Max(0.0, offsetSec), 2),
                 Note = note,
                 Kind = kind
             };
 
             if (_activeManifest != null)
             {
-                _activeManifest.Markers.Add(marker);
+                lock (_activeManifest)
+                {
+                    _activeManifest.Markers.Add(marker);
+                }
             }
 
             manifest = _activeManifest;
@@ -93,6 +119,11 @@ public sealed class MarkerService : IMarkerService
             {
                 Log.Warning(ex, "Failed to persist marker to session manifest.");
             }
+        }
+        else
+        {
+            Log.Information("Marker '{Note}' ignored: no recording is active.", note);
+            return marker;
         }
 
         Log.Information("Marker added: [{Kind}] {Note} (offset {OffsetSec}s)", kind, note, marker.OffsetSec);
@@ -122,7 +153,11 @@ public sealed class MarkerService : IMarkerService
                 Detail = detail
             };
 
-            _activeManifest.Events.Add(entry);
+            lock (_activeManifest)
+            {
+                _activeManifest.Events.Add(entry);
+            }
+
             manifest = _activeManifest;
             metadataBackupDir = _metadataBackupDir;
         }

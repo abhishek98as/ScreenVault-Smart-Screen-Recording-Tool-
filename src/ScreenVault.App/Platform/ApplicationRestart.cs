@@ -16,7 +16,17 @@ public static class ApplicationRestart
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern int UnregisterApplicationRestart();
 
-    public static void Register(string commandLine = "--startrecording --minimize-to-tray --recovered")
+    /// <summary>
+    /// Asks Windows to relaunch ScreenVault after a crash, hang or update restart. Only when a
+    /// recording was running does the relaunch start recording again — otherwise Windows restarting
+    /// the app must never start a recording on its own.
+    /// </summary>
+    public static void Register(bool resumeRecording)
+    {
+        Register(resumeRecording ? "--startrecording --minimize-to-tray --recovered" : "--minimize-to-tray --recovered");
+    }
+
+    public static void Register(string commandLine)
     {
         try
         {

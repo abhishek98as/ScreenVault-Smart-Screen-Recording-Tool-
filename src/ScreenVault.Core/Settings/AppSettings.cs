@@ -63,6 +63,14 @@ public enum TranscriptionMode
     AfterEachPart
 }
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum AppThemeMode
+{
+    System,
+    Light,
+    Dark
+}
+
 public sealed class GeneralSettings
 {
     public bool StartWithWindows { get; set; } = true;
@@ -70,6 +78,7 @@ public sealed class GeneralSettings
     public bool MinimizeToTrayOnLaunch { get; set; } = true;
     public int StartupDelaySeconds { get; set; } = 5;
     public bool ConfirmBeforeStop { get; set; } = true;
+    public AppThemeMode Theme { get; set; } = AppThemeMode.System;
     public NotificationSettings Notifications { get; set; } = new();
 }
 
