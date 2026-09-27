@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Globalization;
 using System.IO.Abstractions;
 using System.Text;
@@ -101,8 +100,8 @@ public sealed class SessionMerger : ISessionMerger
 
         var primaryLocation = manifest.Segments[0].Location;
         var dayFolder = _fileSystem.Path.GetDirectoryName(filePaths[0]) ?? primaryLocation;
-        var titleSuffix = !string.IsNullOrWhiteSpace(manifest.Title) ? $"_{manifest.Title}" : "";
-        var destination = outputFilePath ?? _fileSystem.Path.Combine(dayFolder, $"SV_{sessionId}{titleSuffix}.mkv");
+        var titleSuffix = SafeFileNamePart(manifest.Title);
+        var destination = outputFilePath ?? _fileSystem.Path.Combine(dayFolder, $"SV_{sessionId}{(titleSuffix.Length > 0 ? "_" + titleSuffix : string.Empty)}.mkv");
 
         var locationRoot = StorageDirectoryHelper.GetLocationRoot(_fileSystem, destination);
         var tempDir = StorageDirectoryHelper.GetTempDirectory(_fileSystem, locationRoot);
@@ -131,68 +130,36 @@ public sealed class SessionMerger : ISessionMerger
             _chapterWriter.WriteSessionChapters($"ScreenVault session {sessionId}", manifest.Markers, chaptersFile);
 
             // 3. Run ffmpeg concat
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = _ffmpegPath,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true
-            };
-
-            startInfo.ArgumentList.Add("-hide_banner");
-            startInfo.ArgumentList.Add("-loglevel");
-            startInfo.ArgumentList.Add("error");
-            startInfo.ArgumentList.Add("-f");
-            startInfo.ArgumentList.Add("concat");
-            startInfo.ArgumentList.Add("-safe");
-            startInfo.ArgumentList.Add("0");
-            startInfo.ArgumentList.Add("-i");
-            startInfo.ArgumentList.Add(concatListFile);
+            var args = new List<string> { "-hide_banner", "-nostdin", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concatListFile };
 
             if (_fileSystem.File.Exists(chaptersFile))
             {
-                startInfo.ArgumentList.Add("-i");
-                startInfo.ArgumentList.Add(chaptersFile);
-                startInfo.ArgumentList.Add("-map_chapters");
-                startInfo.ArgumentList.Add("1");
+                args.AddRange(["-i", chaptersFile, "-map_chapters", "1"]);
             }
 
-            startInfo.ArgumentList.Add("-map");
-            startInfo.ArgumentList.Add("0");
-            startInfo.ArgumentList.Add("-c");
-            startInfo.ArgumentList.Add("copy");
+            args.AddRange(["-map", "0", "-c", "copy"]);
 
             var title = !string.IsNullOrWhiteSpace(manifest.Title)
                 ? manifest.Title
                 : $"ScreenVault session {sessionId}";
-            startInfo.ArgumentList.Add("-metadata");
-            startInfo.ArgumentList.Add($"title={title}");
-            startInfo.ArgumentList.Add("-metadata");
-            startInfo.ArgumentList.Add($"comment=ScreenVault session {sessionId}");
-            startInfo.ArgumentList.Add("-metadata");
-            startInfo.ArgumentList.Add($"creation_time={manifest.StartedAtUtc:yyyy-MM-ddTHH:mm:ssZ}");
+            args.AddRange(["-metadata", $"title={title}"]);
+            args.AddRange(["-metadata", $"comment=ScreenVault session {sessionId}"]);
+            args.AddRange(["-metadata", string.Create(CultureInfo.InvariantCulture, $"creation_time={manifest.StartedAtUtc:yyyy-MM-ddTHH:mm:ssZ}")]);
 
-            startInfo.ArgumentList.Add("-y");
-            startInfo.ArgumentList.Add(tempMerged);
+            // The temporary name ends in ".partial", so the container must be named explicitly.
+            args.AddRange(["-f", "matroska", "-y", tempMerged]);
 
             Log.Information("Merging session {SessionId} ({Count} parts) into {Dest}...", sessionId, filePaths.Count, destination);
 
-            using var process = new Process { StartInfo = startInfo };
-            process.Start();
-
-            var stderrTask = process.StandardError.ReadToEndAsync(ct);
-            await process.WaitForExitAsync(ct).ConfigureAwait(false);
-            var stderr = await stderrTask.ConfigureAwait(false);
-
-            if (process.ExitCode != 0)
+            var (exitCode, stderr) = await FfmpegRunner.RunAsync(_ffmpegPath, args, ct: ct).ConfigureAwait(false);
+            if (exitCode != 0)
             {
-                Log.Error("FFmpeg session merge failed with code {Code}: {Error}", process.ExitCode, stderr);
+                Log.Error("FFmpeg session merge failed with code {Code}: {Error}", exitCode, stderr);
                 if (_fileSystem.File.Exists(tempMerged))
                 {
                     _fileSystem.File.Delete(tempMerged);
                 }
-                return new MergeResult(false, null, $"FFmpeg merge exited with code {process.ExitCode}: {stderr}");
+                return new MergeResult(false, null, $"FFmpeg merge exited with code {exitCode}: {stderr}");
             }
 
             // 4. Validate output with ffprobe
@@ -248,5 +215,23 @@ public sealed class SessionMerger : ISessionMerger
             }
             catch { }
         }
+    }
+
+    /// <summary>Turns a user title into something safe for a file name ("" when there is none).</summary>
+    internal static string SafeFileNamePart(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return string.Empty;
+        }
+
+        var invalid = Path.GetInvalidFileNameChars().Concat("<>:\"/\\|?*").ToHashSet();
+        var cleaned = new string(title.Trim().Select(c => invalid.Contains(c) || char.IsControl(c) ? '-' : c).ToArray()).Trim(' ', '.');
+        if (cleaned.Length > 60)
+        {
+            cleaned = cleaned[..60].TrimEnd(' ', '.');
+        }
+
+        return cleaned;
     }
 }

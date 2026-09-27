@@ -27,8 +27,9 @@ public static class FfmpegCommandBuilder
 
         if (settings.Video.DownscaleTo1080p)
         {
-            // System-memory scaling filter if downscale requested
-            filter += ",hwdownload,format=bgra,scale=1920:-2";
+            // System-memory scaling filter if downscale requested. Only ever shrink: screens narrower
+            // than 1920 px keep their size (scaling them up would just waste space). Width stays even.
+            filter += ",hwdownload,format=bgra,scale=w='trunc(min(1920,iw)/2)*2':h=-2";
         }
         else
         {

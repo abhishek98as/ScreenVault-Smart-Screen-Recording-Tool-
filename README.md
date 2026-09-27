@@ -67,6 +67,9 @@ Press `Ctrl+Alt+Shift+M` to drop a timestamped note mid-meeting. Notes are saved
 ### 🔒 100% Offline — Zero Telemetry
 ScreenVault makes **no network requests**, collects no data, and operates entirely offline. Your recordings stay yours.
 
+### 🎨 Modern Windows 11 Interface
+Fluent-style windows that follow Windows **light/dark mode** automatically (or pick one in **Settings → General → Theme**), with rounded corners, themed title bars, a compact status flyout with live audio meters, a sidebar-based Settings window with toggle switches, and a matching light/dark installer. High-contrast mode is respected.
+
 ---
 
 ## 🖥️ System Requirements
@@ -121,7 +124,7 @@ ScreenVault lives quietly in your system tray next to the clock:
 | `Ctrl+Alt+Shift+P` | Pause / Resume recording |
 | `Ctrl+Alt+Shift+S` | Toggle Status Window |
 
-> All hotkeys are fully customizable in **Settings → Hotkeys**.
+> All hotkeys are customizable in **Settings → Shortcuts** — click a shortcut and press the new key combination. Changes apply immediately.
 
 ---
 
@@ -193,7 +196,9 @@ ScreenVault/
 │   │   ├── TrayApplicationContext.cs
 │   │   ├── Program.cs
 │   │   ├── Platform/             # StartWithWindows, RestartManagerWindow
-│   │   ├── UI/                   # SettingsForm, StatusWindow, MarkerDialog
+│   │   ├── UI/                   # Status flyout, Settings, Library, Wizard, dialogs
+│   │   │   ├── Theming/          # Design tokens (light/dark/high contrast), fonts, icons
+│   │   │   └── Controls/         # Fluent controls: buttons, toggles, inputs, cards
 │   │   └── Ipc/                  # Named pipe server/client
 │   └── ScreenVault.Core/         # Pure business logic (no UI dependencies)
 │       ├── Recording/            # RecordingEngine, ResumeStateService
@@ -216,7 +221,8 @@ ScreenVault/
 ### Prerequisites
 - [.NET 9.0 SDK](https://dotnet.microsoft.com/download) or newer
 - Windows 10/11 x64
-- *(Optional)* [Inno Setup 6](https://jrsoftware.org/isinfo.php) for building the installer
+- *(Optional)* [Inno Setup 6.7+ (7.x recommended)](https://jrsoftware.org/isdl.php) for building the installer
+- *(Optional)* Python 3 + Pillow to regenerate the icon and installer artwork (`python tools/branding/generate_assets.py`)
 
 ```bash
 # 1. Clone the repo
@@ -236,7 +242,7 @@ dotnet publish src/ScreenVault.App -c Release -r win-x64 \
   -p:PublishReadyToRun=true \
   -o publish/
 
-# 5. Build full installer (requires Inno Setup 6 in PATH)
+# 5. Build full installer (requires Inno Setup 6.7+ / 7.x)
 .\build\build.ps1 -Version "1.0.0"
 # → Produces: dist/ScreenVault-1.0.0-Setup.exe
 ```

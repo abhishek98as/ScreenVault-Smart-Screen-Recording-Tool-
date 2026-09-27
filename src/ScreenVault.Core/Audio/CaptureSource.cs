@@ -14,10 +14,15 @@ public sealed class CaptureSource : IDisposable
     private readonly LevelMeter _meter = new();
 
     private DateTime _lastDataReceivedUtc = DateTime.UtcNow;
-    private bool _isDisposed;
+    private volatile bool _isDisposed;
+    private volatile bool _isFaulted;
 
-    public string DeviceId => _device.ID;
-    public string DeviceFriendlyName => _device.FriendlyName;
+    public string DeviceId { get; }
+    public string DeviceFriendlyName { get; }
+    public DateTime CreatedUtc { get; } = DateTime.UtcNow;
+
+    /// <summary>True once capture stopped on its own (device invalidated, driver reset…).</summary>
+    public bool IsFaulted => _isFaulted;
     public bool IsLoopback => _isLoopback;
     public JitterBuffer Jitter => _jitterBuffer;
     public LevelMeter Meter => _meter;
@@ -30,6 +35,10 @@ public sealed class CaptureSource : IDisposable
         _device = device;
         _isLoopback = isLoopback;
         _jitterBuffer = new JitterBuffer(jitterTargetMs);
+
+        // Read once: the COM properties are not reliable after the device has been invalidated.
+        DeviceId = device.ID;
+        DeviceFriendlyName = SafeFriendlyName(device);
 
         if (isLoopback)
         {
@@ -50,12 +59,15 @@ public sealed class CaptureSource : IDisposable
             _capture.StartRecording();
             Log.Information("Started capture on {Type} device '{Name}' ({Format})",
                 isLoopback ? "Loopback" : "Mic",
-                device.FriendlyName,
+                DeviceFriendlyName,
                 _capture.WaveFormat);
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Failed to start capture on '{Name}'", device.FriendlyName);
+            Log.Error(ex, "Failed to start capture on '{Name}'", DeviceFriendlyName);
+            _capture.DataAvailable -= OnDataAvailable;
+            _capture.RecordingStopped -= OnRecordingStopped;
+            _capture.Dispose();
             throw;
         }
     }
@@ -69,7 +81,7 @@ public sealed class CaptureSource : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Debug(ex, "Error processing audio data on '{Name}'", _device.FriendlyName);
+            Log.Debug(ex, "Error processing audio data on '{Name}'", DeviceFriendlyName);
         }
     }
 
@@ -77,15 +89,18 @@ public sealed class CaptureSource : IDisposable
     {
         if (_isDisposed) return;
 
+        // Any stop we did not ask for (with or without an error) leaves this source silent for good.
+        _isFaulted = true;
         if (e.Exception != null)
         {
-            Log.Warning(e.Exception, "Audio capture stopped unexpectedly on '{Name}'", _device.FriendlyName);
-            Faulted?.Invoke(this, e.Exception);
+            Log.Warning(e.Exception, "Audio capture stopped unexpectedly on '{Name}'", DeviceFriendlyName);
         }
         else
         {
-            Log.Information("Audio capture stopped on '{Name}'", _device.FriendlyName);
+            Log.Warning("Audio capture stopped on '{Name}' without being asked to", DeviceFriendlyName);
         }
+
+        Faulted?.Invoke(this, e.Exception);
     }
 
     public bool CheckHealth()
@@ -95,7 +110,7 @@ public sealed class CaptureSource : IDisposable
         {
             if ((DateTime.UtcNow - _lastDataReceivedUtc).TotalSeconds > 3.0)
             {
-                Log.Warning("Mic health check failed: no data for 3s on '{Name}'", _device.FriendlyName);
+                Log.Warning("Mic health check failed: no data for 3s on '{Name}'", DeviceFriendlyName);
                 return false;
             }
         }
@@ -121,5 +136,17 @@ public sealed class CaptureSource : IDisposable
 
         _capture.Dispose();
         _device.Dispose();
+    }
+
+    private static string SafeFriendlyName(MMDevice device)
+    {
+        try
+        {
+            return device.FriendlyName;
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException)
+        {
+            return "Audio device";
+        }
     }
 }

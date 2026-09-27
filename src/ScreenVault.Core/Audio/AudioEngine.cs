@@ -32,6 +32,13 @@ public interface IAudioEngine : IDisposable
     void AttachOutput(Stream ffmpegStdin);
     void DetachOutput();
     void SetMonitoring(bool enabled);
+
+    /// <summary>
+    /// Keeps capture (and level meters) running while at least one owner wants it, e.g. the status
+    /// window and the settings window independently. Each owner switches only its own request.
+    /// </summary>
+    void SetMonitoring(object owner, bool enabled) => SetMonitoring(enabled);
+
     void SetMicMute(bool muted);
     bool IsMicMuted { get; }
     void ApplySettings(AudioSettings settings);
@@ -60,14 +67,18 @@ public sealed class AudioEngine : IAudioEngine
     private readonly System.Threading.Timer _debounceTimer;
     private readonly System.Threading.Timer _safetyTimer;
 
+    private readonly HashSet<object> _monitoringOwners = new(ReferenceEqualityComparer.Instance);
+    private static readonly object DefaultMonitoringOwner = new();
+
     private DeviceWatcher? _watcher;
     private AudioSettings _settings = new();
     private List<string> _currentDegradedFlags = [];
-    private bool _started;
+    private volatile CaptureSource[] _sourcesSnapshot = [];
+    private volatile bool _started;
     private bool _outputAttached;
     private bool _captureDesired;
     private bool _monitoringEnabled;
-    private bool _isMicMuted;
+    private volatile bool _isMicMuted;
     private string _lastSwitchSummary = "No device changes yet";
     private string _micDisplayStatus = "✖ None";
     private string _systemDisplayStatus = "✖ None";
@@ -134,14 +145,19 @@ public sealed class AudioEngine : IAudioEngine
         });
     }
 
-    public void SetMonitoring(bool enabled)
+    public void SetMonitoring(bool enabled) => SetMonitoring(DefaultMonitoringOwner, enabled);
+
+    public void SetMonitoring(object owner, bool enabled)
     {
+        ArgumentNullException.ThrowIfNull(owner);
         _controlThread.Post(() =>
         {
-            if (_monitoringEnabled != enabled)
+            var changed = enabled ? _monitoringOwners.Add(owner) : _monitoringOwners.Remove(owner);
+            var monitoring = _monitoringOwners.Count > 0;
+            if (changed && _monitoringEnabled != monitoring)
             {
-                Log.Information("AudioEngine SetMonitoring: {Enabled}", enabled);
-                _monitoringEnabled = enabled;
+                Log.Information("AudioEngine monitoring: {Enabled}", monitoring);
+                _monitoringEnabled = monitoring;
                 ReconcileInternal();
             }
         });
@@ -149,19 +165,26 @@ public sealed class AudioEngine : IAudioEngine
 
     public void SetMicMute(bool muted)
     {
-        _controlThread.Post(() =>
+        // Update the flag immediately so a quick second toggle (or the UI refreshing right after)
+        // sees the new state; the gain change itself happens on the audio control thread.
+        if (_isMicMuted == muted)
         {
-            if (_isMicMuted != muted)
-            {
-                _isMicMuted = muted;
-                Log.Information("AudioEngine SetMicMute: {Muted}", muted);
-                var micGainLinear = _isMicMuted ? 0f : Mixer.DbToLinear(_settings.MicGainDb);
-                foreach (var src in _activeSources.Values.Where(s => !s.IsLoopback))
-                {
-                    src.GroupGainLinear = micGainLinear;
-                }
-            }
-        });
+            return;
+        }
+
+        _isMicMuted = muted;
+        Log.Information("AudioEngine SetMicMute: {Muted}", muted);
+        _controlThread.Post(ApplyGroupGains);
+    }
+
+    private void ApplyGroupGains()
+    {
+        var micGainLinear = _isMicMuted ? 0f : Mixer.DbToLinear(_settings.MicGainDb);
+        var sysGainLinear = Mixer.DbToLinear(_settings.SystemGainDb);
+        foreach (var src in _activeSources.Values)
+        {
+            src.GroupGainLinear = src.IsLoopback ? sysGainLinear : micGainLinear;
+        }
     }
 
     public void ApplySettings(AudioSettings settings)
@@ -171,21 +194,18 @@ public sealed class AudioEngine : IAudioEngine
         {
             _settings = settings;
             Log.Information("Applying updated AudioSettings.");
-            var micGainLinear = _isMicMuted ? 0f : Mixer.DbToLinear(_settings.MicGainDb);
-            var sysGainLinear = Mixer.DbToLinear(_settings.SystemGainDb);
-            foreach (var src in _activeSources.Values)
-            {
-                src.GroupGainLinear = src.IsLoopback ? sysGainLinear : micGainLinear;
-            }
+            ApplyGroupGains();
             ReconcileInternal();
         });
     }
 
     public AudioStatus GetStatus()
     {
+        // The source dictionary belongs to the audio control thread; read the published snapshot.
+        var sources = _sourcesSnapshot;
         lock (_stateLock)
         {
-            var deviceStatuses = _activeSources.Values
+            var deviceStatuses = sources
                 .Select(s => new AudioDeviceStatus(s.DeviceId, s.DeviceFriendlyName, s.IsLoopback, s.Meter.PeakDb, s.Meter.RmsDb))
                 .ToList();
 
@@ -244,12 +264,12 @@ public sealed class AudioEngine : IAudioEngine
                 if (_activeSources.Count > 0)
                 {
                     Log.Information("AudioEngine: neither recording nor monitoring. Closing {Count} capture source(s) for privacy.", _activeSources.Count);
+                    PublishSources([]);
                     foreach (var src in _activeSources.Values)
                     {
                         src.Dispose();
                     }
                     _activeSources.Clear();
-                    _pump.UpdateSources([]);
                 }
                 UpdateDisplayStatuses(null);
                 return;
@@ -258,6 +278,7 @@ public sealed class AudioEngine : IAudioEngine
             var resolution = EndpointResolver.Resolve(_enumerator, _settings);
             var desiredIds = resolution.DesiredEndpoints.ToDictionary(e => e.Id, StringComparer.OrdinalIgnoreCase);
             var changed = false;
+            var now = DateTime.UtcNow;
 
             // Remove retry tracking for endpoints no longer desired
             var nonDesiredRetries = _retryTracker.Keys.Where(id => !desiredIds.ContainsKey(id)).ToList();
@@ -266,13 +287,53 @@ public sealed class AudioEngine : IAudioEngine
                 _retryTracker.Remove(id);
             }
 
-            // 1. Remove sources no longer desired
-            var toRemove = _activeSources.Keys.Where(id => !desiredIds.ContainsKey(id)).ToList();
+            // 1. Remove sources no longer desired, and sources whose capture died (driver reset,
+            //    Bluetooth profile switch, exclusive-mode takeover): they are re-created below.
+            var toRemove = _activeSources
+                .Where(kv => !desiredIds.ContainsKey(kv.Key) || kv.Value.IsFaulted)
+                .Select(kv => kv.Key)
+                .ToList();
+            if (toRemove.Count > 0)
+            {
+                PublishSources(_activeSources.Where(kv => !toRemove.Contains(kv.Key)).Select(kv => kv.Value).ToArray());
+            }
+
             foreach (var id in toRemove)
             {
                 if (_activeSources.Remove(id, out var src))
                 {
-                    Log.Information("Removing audio source '{Name}' ({Id})", src.DeviceFriendlyName, id);
+                    if (src.IsFaulted)
+                    {
+                        // Back off if the device keeps failing right after being reopened.
+                        if (!_retryTracker.TryGetValue(id, out var retry))
+                        {
+                            retry = new RetryInfo();
+                            _retryTracker[id] = retry;
+                        }
+
+                        if (now - src.CreatedUtc > TimeSpan.FromMinutes(1))
+                        {
+                            retry.FailureCount = 0;
+                        }
+
+                        retry.FailureCount++;
+                        var delayMs = retry.FailureCount switch
+                        {
+                            1 => 250,
+                            2 => 1000,
+                            3 => 2000,
+                            _ => 10000
+                        };
+                        retry.NextRetryUtc = now.AddMilliseconds(delayMs);
+                        retry.Reason = "capture stopped unexpectedly";
+                        ScheduleReconcile(delayMs);
+                        Log.Warning("Restarting audio source '{Name}' ({Id}) in {Delay}ms after its capture stopped unexpectedly", src.DeviceFriendlyName, id, delayMs);
+                    }
+                    else
+                    {
+                        Log.Information("Removing audio source '{Name}' ({Id})", src.DeviceFriendlyName, id);
+                    }
+
                     src.Dispose();
                     changed = true;
                 }
@@ -281,7 +342,6 @@ public sealed class AudioEngine : IAudioEngine
             // 2. Add new desired sources with retry backoff
             var micGainLinear = _isMicMuted ? 0f : Mixer.DbToLinear(_settings.MicGainDb);
             var sysGainLinear = Mixer.DbToLinear(_settings.SystemGainDb);
-            var now = DateTime.UtcNow;
 
             foreach (var ep in resolution.DesiredEndpoints)
             {
@@ -292,13 +352,15 @@ public sealed class AudioEngine : IAudioEngine
                         continue;
                     }
 
+                    NAudio.CoreAudioApi.MMDevice? mmDevice = null;
                     try
                     {
-                        var mmDevice = _enumerator.GetDevice(ep.Id);
+                        mmDevice = _enumerator.GetDevice(ep.Id);
                         var source = new CaptureSource(mmDevice, ep.IsLoopback, _settings.JitterTargetMs)
                         {
                             GroupGainLinear = ep.IsLoopback ? sysGainLinear : micGainLinear
                         };
+                        mmDevice = null; // owned by the source now
 
                         source.Faulted += (_, ex) =>
                         {
@@ -311,12 +373,17 @@ public sealed class AudioEngine : IAudioEngine
                                 $"Capture faulted on '{ep.Name}': {ex?.Message}"));
                         };
                         _activeSources[ep.Id] = source;
-                        _retryTracker.Remove(ep.Id);
+                        if (_retryTracker.TryGetValue(ep.Id, out var prior))
+                        {
+                            // Keep the failure count (it escalates if the device fails again soon).
+                            prior.NextRetryUtc = DateTime.MinValue;
+                        }
                         changed = true;
                         Log.Information("Added active audio source '{Name}' ({Id})", ep.Name, ep.Id);
                     }
                     catch (Exception ex)
                     {
+                        mmDevice?.Dispose();
                         var hr = ex is System.Runtime.InteropServices.COMException comEx ? comEx.ErrorCode : ex.HResult;
                         if (!_retryTracker.TryGetValue(ep.Id, out var r))
                         {
@@ -334,6 +401,7 @@ public sealed class AudioEngine : IAudioEngine
                         };
                         r.NextRetryUtc = now.AddMilliseconds(delayMs);
                         r.Reason = $"0x{hr:X8} ({ex.Message})";
+                        ScheduleReconcile(delayMs);
                         Log.Warning(ex, "Could not start audio capture source for '{Name}' ({Id}). HRESULT: 0x{Hr:X8}. Retry in {Delay}ms.",
                             ep.Name, ep.Id, hr, delayMs);
                     }
@@ -347,7 +415,7 @@ public sealed class AudioEngine : IAudioEngine
 
             // Update pump sources array atomically
             var sourcesArray = _activeSources.Values.ToArray();
-            _pump.UpdateSources(sourcesArray);
+            PublishSources(sourcesArray);
 
             UpdateDisplayStatuses(resolution);
 
@@ -369,6 +437,25 @@ public sealed class AudioEngine : IAudioEngine
         }
     }
 
+    /// <summary>Runs a reconcile after <paramref name="delayMs"/> so retries don't wait for the 5 s safety timer.</summary>
+    private void ScheduleReconcile(int delayMs)
+    {
+        try
+        {
+            _debounceTimer.Change(delayMs + 10, Timeout.Infinite);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Shutting down.
+        }
+    }
+
+    private void PublishSources(CaptureSource[] sources)
+    {
+        _sourcesSnapshot = sources;
+        _pump.UpdateSources(sources);
+    }
+
     private void UpdateDisplayStatuses(EndpointResolutionResult? resolution)
     {
         lock (_stateLock)
@@ -388,7 +475,11 @@ public sealed class AudioEngine : IAudioEngine
                 else
                 {
                     var desiredMic = resolution?.DesiredEndpoints.FirstOrDefault(e => !e.IsLoopback);
-                    if (desiredMic != null && _retryTracker.TryGetValue(desiredMic.Id, out var retry))
+                    if (resolution == null)
+                    {
+                        _micDisplayStatus = "✖ Not in use";
+                    }
+                    else if (desiredMic != null && _retryTracker.TryGetValue(desiredMic.Id, out var retry))
                     {
                         _micDisplayStatus = $"⟳ Retrying: {retry.Reason}";
                     }
@@ -414,7 +505,11 @@ public sealed class AudioEngine : IAudioEngine
                 else
                 {
                     var desiredSys = resolution?.DesiredEndpoints.FirstOrDefault(e => e.IsLoopback);
-                    if (desiredSys != null && _retryTracker.TryGetValue(desiredSys.Id, out var retry))
+                    if (resolution == null)
+                    {
+                        _systemDisplayStatus = "✖ Not in use";
+                    }
+                    else if (desiredSys != null && _retryTracker.TryGetValue(desiredSys.Id, out var retry))
                     {
                         _systemDisplayStatus = $"⟳ Retrying: {retry.Reason}";
                     }
@@ -436,6 +531,7 @@ public sealed class AudioEngine : IAudioEngine
         {
             _started = false;
             _watcher?.Dispose();
+            PublishSources([]);
             foreach (var src in _activeSources.Values)
             {
                 src.Dispose();

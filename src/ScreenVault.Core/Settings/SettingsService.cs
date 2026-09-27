@@ -11,6 +11,10 @@ public interface ISettingsService
     AppSettings Current { get; }
     string SettingsFilePath { get; }
     bool WasMigrated { get; }
+
+    /// <summary>True when no settings existed yet (first launch for this user).</summary>
+    bool IsFirstRun => false;
+
     event EventHandler<AppSettings>? SettingsChanged;
     void Save(AppSettings newSettings);
     void Reload();
@@ -53,6 +57,7 @@ public sealed class SettingsService : ISettingsService
 
     public string SettingsFilePath => _settingsPath;
     public bool WasMigrated { get; private set; }
+    public bool IsFirstRun { get; private set; }
 
     public SettingsService(string? customSettingsPath = null, bool isPortable = false, IFileSystem? fileSystem = null)
     {
@@ -74,6 +79,7 @@ public sealed class SettingsService : ISettingsService
         }
 
         _backupPath = _settingsPath + ".bak";
+        IsFirstRun = !_fileSystem.File.Exists(_settingsPath) && !_fileSystem.File.Exists(_backupPath);
         _current = LoadInternal();
     }
 

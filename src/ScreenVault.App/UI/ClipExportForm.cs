@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using ScreenVault.App.Platform;
+using ScreenVault.App.UI.Controls;
+using ScreenVault.App.UI.Theming;
 using ScreenVault.Core.PostProcessing;
 using ScreenVault.Core.Sessions;
 using ScreenVault.Core.Settings;
@@ -9,27 +11,35 @@ using Serilog;
 
 namespace ScreenVault.App.UI;
 
-public sealed class ClipExportForm : Form
+/// <summary>Exports part of a recording (full, last 5 minutes, around a marker, or a custom range).</summary>
+public sealed class ClipExportForm : ModernForm
 {
+    private const string FullSession = "Full recording";
+    private const string LastFiveMinutes = "Last 5 minutes";
+    private const string CustomRange = "Custom range";
+    private const string MarkerPrefix = "Around marker: ";
+
     private readonly SessionManifest _manifest;
     private readonly IClipExporter _clipExporter;
     private readonly PlayerLauncher _playerLauncher;
 
-    private readonly ComboBox _cmbPreset;
-    private readonly NumericUpDown _numStartSec;
-    private readonly NumericUpDown _numEndSec;
-    private readonly ComboBox _cmbFormat;
-    private readonly CheckBox _chkPrecise;
-    private readonly TextBox _txtDest;
-    private readonly Button _btnBrowse;
-    private readonly ProgressBar _progressBar;
-    private readonly Label _lblStatus;
-    private readonly Button _btnExport;
-    private readonly Button _btnPlay;
-    private readonly Button _btnShowInFolder;
-    private readonly Button _btnClose;
+    private readonly ModernComboBox _cmbPreset;
+    private readonly NumberField _numStartSec;
+    private readonly NumberField _numEndSec;
+    private readonly TextLabel _lblStartTime;
+    private readonly TextLabel _lblEndTime;
+    private readonly SegmentedControl _format;
+    private readonly ToggleSwitch _chkPrecise;
+    private readonly TextField _txtDest;
+    private readonly ModernProgressBar _progressBar;
+    private readonly TextLabel _lblStatus;
+    private readonly ModernButton _btnExport;
+    private readonly ModernButton _btnPlay;
+    private readonly ModernButton _btnShowInFolder;
 
+    private bool _updatingFromPreset;
     private string? _exportedFilePath;
+    private CancellationTokenSource? _exportCts;
 
     public ClipExportForm(
         SessionManifest manifest,
@@ -41,95 +51,98 @@ public sealed class ClipExportForm : Form
         _playerLauncher = playerLauncher ?? throw new ArgumentNullException(nameof(playerLauncher));
 
         Text = "ScreenVault – Export Clip";
-        var appIcon = AppIcon.Get();
-        if (appIcon != null) Icon = appIcon;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
-        AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(460, 360);
-        TopMost = true;
+        ClientSize = new Size(560, 504);
 
         var totalDurationSec = _manifest.Segments.Sum(s => s.DurationSec ?? 0.0);
         if (totalDurationSec <= 0)
         {
             totalDurationSec = ((_manifest.EndedAtUtc ?? DateTime.UtcNow) - _manifest.StartedAtUtc).TotalSeconds;
         }
+
         if (totalDurationSec <= 0) totalDurationSec = 60.0;
 
-        var lblPreset = new Label { Text = "Range Preset:", Location = new Point(20, 20), AutoSize = true };
-        _cmbPreset = new ComboBox { Location = new Point(140, 16), Width = 280, DropDownStyle = ComboBoxStyle.DropDownList };
-        _cmbPreset.Items.Add("Full Session");
-        _cmbPreset.Items.Add("Last 5 Minutes");
-        if (_manifest.Markers.Count > 0)
+        // ── Header ───────────────────────────────────────────────────────────────────
+        var badge = new GlyphBadge { Glyph = Glyphs.Cut, Tone = Tone.Accent, Bounds = new Rectangle(28, 24, 44, 44) };
+        var title = new TextLabel("Export a clip", Typography.Title) { Location = new Point(84, 22) };
+        var sessionName = string.IsNullOrWhiteSpace(_manifest.Title)
+            ? _manifest.StartedAtUtc.ToLocalTime().ToString("dddd d MMMM yyyy, HH:mm", CultureInfo.CurrentCulture)
+            : _manifest.Title;
+        var subtitle = new TextLabel($"{sessionName} · {FormatTime(totalDurationSec)} long", Typography.Body, TextTone.Secondary)
         {
-            foreach (var m in _manifest.Markers)
-            {
-                var timeStr = TimeSpan.FromSeconds(m.OffsetSec).ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture);
-                _cmbPreset.Items.Add($"Marker: {m.Note} ({timeStr}) ± 2 min");
-            }
+            AutoSize = false,
+            AutoEllipsis = true,
+            Bounds = new Rectangle(86, 50, 446, 20)
+        };
+
+        // ── Form fields ──────────────────────────────────────────────────────────────
+        const int labelX = 28;
+        const int fieldX = 176;
+
+        _cmbPreset = new ModernComboBox { Bounds = new Rectangle(fieldX, 92, 356, 32) };
+        _cmbPreset.Items.Add(FullSession);
+        _cmbPreset.Items.Add(LastFiveMinutes);
+        foreach (var m in _manifest.Markers)
+        {
+            var note = string.IsNullOrWhiteSpace(m.Note) ? "marker" : m.Note;
+            _cmbPreset.Items.Add($"{MarkerPrefix}{note} ({FormatTime(m.OffsetSec)}) ± 2 min");
         }
-        _cmbPreset.Items.Add("Custom Range");
+
+        _cmbPreset.Items.Add(CustomRange);
         _cmbPreset.SelectedIndex = 0;
         _cmbPreset.SelectedIndexChanged += (_, _) => OnPresetChanged(totalDurationSec);
 
-        var lblStart = new Label { Text = "Start time (seconds):", Location = new Point(20, 58), AutoSize = true };
-        _numStartSec = new NumericUpDown { Location = new Point(140, 56), Width = 100, Maximum = (decimal)totalDurationSec, DecimalPlaces = 1 };
+        _numStartSec = new NumberField { Bounds = new Rectangle(fieldX, 140, 150, 32), DecimalPlaces = 1, Maximum = (decimal)totalDurationSec, Suffix = "s" };
+        _lblStartTime = new TextLabel(FormatTime(0), Typography.Body, TextTone.Secondary) { Location = new Point(fieldX + 162, 146) };
+        _numEndSec = new NumberField { Bounds = new Rectangle(fieldX, 188, 150, 32), DecimalPlaces = 1, Maximum = (decimal)totalDurationSec, Value = (decimal)totalDurationSec, Suffix = "s" };
+        _lblEndTime = new TextLabel(FormatTime(totalDurationSec), Typography.Body, TextTone.Secondary) { Location = new Point(fieldX + 162, 194) };
+        _numStartSec.ValueChanged += (_, _) => OnRangeEdited();
+        _numEndSec.ValueChanged += (_, _) => OnRangeEdited();
 
-        var lblEnd = new Label { Text = "End time (seconds):", Location = new Point(20, 95), AutoSize = true };
-        _numEndSec = new NumericUpDown { Location = new Point(140, 93), Width = 100, Maximum = (decimal)totalDurationSec, Value = (decimal)totalDurationSec, DecimalPlaces = 1 };
+        _format = new SegmentedControl { Bounds = new Rectangle(fieldX, 236, 200, 34), AccessibleName = "Output format" };
+        _format.AddItem("MP4");
+        _format.AddItem("MKV");
+        _format.SelectedIndex = 0;
+        _format.SelectedIndexChanged += (_, _) => SyncDestinationExtension();
 
-        var lblFormat = new Label { Text = "Output format:", Location = new Point(20, 132), AutoSize = true };
-        _cmbFormat = new ComboBox { Location = new Point(140, 129), Width = 120, DropDownStyle = ComboBoxStyle.DropDownList };
-        _cmbFormat.Items.AddRange(["MP4 (Recommended)", "MKV"]);
-        _cmbFormat.SelectedIndex = 0;
+        _chkPrecise = new ToggleSwitch { ShowStateText = false, Location = new Point(fieldX - 2, 290) };
 
-        _chkPrecise = new CheckBox { Text = "Precise re-encode (exact cut points, slower)", Location = new Point(140, 165), AutoSize = true };
-
-        var lblDest = new Label { Text = "Destination:", Location = new Point(20, 198), AutoSize = true };
         var defaultFolder = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
-        var defaultName = $"Clip_{_manifest.SessionId}.mp4";
-        _txtDest = new TextBox { Location = new Point(140, 195), Width = 220, Text = Path.Combine(defaultFolder, defaultName) };
-        _btnBrowse = new Button { Text = "Browse…", Location = new Point(365, 193), Width = 75, Height = 26 };
-        _btnBrowse.Click += (_, _) =>
+        _txtDest = new TextField { Bounds = new Rectangle(fieldX, 342, 262, 32), Text = Path.Combine(defaultFolder, $"Clip_{_manifest.SessionId}.mp4") };
+        var btnBrowse = new ModernButton("Browse…", ButtonKind.Secondary) { Bounds = new Rectangle(446, 342, 86, 32) };
+        btnBrowse.Click += (_, _) => BrowseDestination();
+
+        _progressBar = new ModernProgressBar { Bounds = new Rectangle(28, 396, 504, 6), Visible = false };
+        _lblStatus = new TextLabel("Choose a range and press Export.", Typography.Caption, TextTone.Secondary)
         {
-            var isMp4 = _cmbFormat.SelectedIndex == 0;
-            using var sfd = new SaveFileDialog
-            {
-                Filter = isMp4 ? "MP4 Video (*.mp4)|*.mp4" : "Matroska Video (*.mkv)|*.mkv",
-                FileName = Path.GetFileName(_txtDest.Text),
-                InitialDirectory = Path.GetDirectoryName(_txtDest.Text)
-            };
-            if (sfd.ShowDialog(this) == DialogResult.OK)
-            {
-                _txtDest.Text = sfd.FileName;
-            }
+            AutoSize = false,
+            AutoEllipsis = true,
+            Bounds = new Rectangle(28, 408, 504, 18)
         };
 
-        _progressBar = new ProgressBar { Location = new Point(20, 235), Size = new Size(420, 14), Minimum = 0, Maximum = 100 };
-        _lblStatus = new Label { Location = new Point(20, 255), Size = new Size(420, 20), Text = "Ready to export." };
+        Controls.AddRange(
+        [
+            badge, title, subtitle,
+            FieldLabel("Range", labelX, 98), _cmbPreset,
+            FieldLabel("Start", labelX, 146), _numStartSec, _lblStartTime,
+            FieldLabel("End", labelX, 194), _numEndSec, _lblEndTime,
+            FieldLabel("Format", labelX, 244), _format,
+            FieldLabel("Precise cut", labelX, 286), new TextLabel("Exact start and end (re-encodes, slower)", Typography.Caption, TextTone.Secondary) { Location = new Point(labelX, 306) }, _chkPrecise,
+            FieldLabel("Save to", labelX, 348), _txtDest, btnBrowse,
+            _progressBar, _lblStatus
+        ]);
 
-        _btnExport = new Button
-        {
-            Location = new Point(20, 285),
-            Size = new Size(110, 32),
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            BackColor = Color.FromArgb(30, 142, 62),
-            ForeColor = Color.White,
-            FlatStyle = FlatStyle.Flat,
-            Text = "Export Clip"
-        };
-        _btnExport.FlatAppearance.BorderSize = 0;
-        _btnExport.Click += async (_, _) => await RunExportAsync();
-
-        _btnPlay = new Button { Location = new Point(135, 285), Size = new Size(80, 32), Text = "▶ Play", Enabled = false };
+        // ── Footer ───────────────────────────────────────────────────────────────────
+        var footer = new SurfacePanel { Size = new Size(560, 68), Dock = DockStyle.Bottom, TopDivider = true };
+        _btnPlay = new ModernButton("Play", ButtonKind.Subtle, Glyphs.Play) { Bounds = new Rectangle(16, 18, 84, 32), Enabled = false };
         _btnPlay.Click += (_, _) =>
         {
             if (!string.IsNullOrEmpty(_exportedFilePath)) _playerLauncher.Launch(_exportedFilePath);
         };
-
-        _btnShowInFolder = new Button { Location = new Point(220, 285), Size = new Size(115, 32), Text = "Show in Folder", Enabled = false };
+        _btnShowInFolder = new ModernButton("Show in folder", ButtonKind.Subtle, Glyphs.FolderOpen) { Bounds = new Rectangle(104, 18, 140, 32), Enabled = false };
         _btnShowInFolder.Click += (_, _) =>
         {
             if (!string.IsNullOrEmpty(_exportedFilePath) && File.Exists(_exportedFilePath))
@@ -138,52 +151,120 @@ public sealed class ClipExportForm : Form
             }
         };
 
-        _btnClose = new Button { Location = new Point(340, 285), Size = new Size(80, 32), Text = "Close" };
-        _btnClose.Click += (_, _) => Close();
+        var btnClose = new ModernButton("Close", ButtonKind.Secondary) { Bounds = new Rectangle(328, 18, 88, 32), DialogResult = DialogResult.Cancel };
+        _btnExport = new ModernButton("Export clip", ButtonKind.Primary, Glyphs.Export) { Bounds = new Rectangle(424, 18, 112, 32) };
+        _btnExport.Click += async (_, _) => await RunExportAsync();
+        footer.Controls.AddRange([_btnPlay, _btnShowInFolder, btnClose, _btnExport]);
+        Controls.Add(footer);
 
-        Controls.Add(lblPreset);
-        Controls.Add(_cmbPreset);
-        Controls.Add(lblStart);
-        Controls.Add(_numStartSec);
-        Controls.Add(lblEnd);
-        Controls.Add(_numEndSec);
-        Controls.Add(lblFormat);
-        Controls.Add(_cmbFormat);
-        Controls.Add(_chkPrecise);
-        Controls.Add(lblDest);
-        Controls.Add(_txtDest);
-        Controls.Add(_btnBrowse);
-        Controls.Add(_progressBar);
-        Controls.Add(_lblStatus);
-        Controls.Add(_btnExport);
-        Controls.Add(_btnPlay);
-        Controls.Add(_btnShowInFolder);
-        Controls.Add(_btnClose);
+        AcceptButton = _btnExport;
+        CancelButton = btnClose;
+
+        ResumeLayout(false);
+        PerformLayout();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // Closing while exporting stops FFmpeg and removes the unfinished file.
+        _exportCts?.Cancel();
+        base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _exportCts?.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    private static TextLabel FieldLabel(string text, int x, int y) => new(text, Typography.BodyStrong) { Location = new Point(x, y) };
+
+    private static string FormatTime(double seconds)
+    {
+        var time = TimeSpan.FromSeconds(Math.Max(0, seconds));
+        return time.TotalHours >= 1
+            ? time.ToString(@"h\:mm\:ss", CultureInfo.InvariantCulture)
+            : time.ToString(@"m\:ss", CultureInfo.InvariantCulture);
+    }
+
+    private void OnRangeEdited()
+    {
+        _lblStartTime.Text = FormatTime((double)_numStartSec.Value);
+        _lblEndTime.Text = FormatTime((double)_numEndSec.Value);
+        if (!_updatingFromPreset && _cmbPreset.SelectedIndex != _cmbPreset.Items.Count - 1)
+        {
+            _cmbPreset.SelectedIndex = _cmbPreset.Items.Count - 1; // Custom range
+        }
     }
 
     private void OnPresetChanged(double totalDurationSec)
     {
         var text = _cmbPreset.SelectedItem?.ToString() ?? string.Empty;
-        if (text == "Full Session")
+        _updatingFromPreset = true;
+        try
         {
-            _numStartSec.Value = 0;
-            _numEndSec.Value = (decimal)totalDurationSec;
-        }
-        else if (text == "Last 5 Minutes")
-        {
-            _numStartSec.Value = (decimal)Math.Max(0.0, totalDurationSec - 300.0);
-            _numEndSec.Value = (decimal)totalDurationSec;
-        }
-        else if (text.StartsWith("Marker:", StringComparison.OrdinalIgnoreCase))
-        {
-            // Find marker
-            var markerIdx = _cmbPreset.SelectedIndex - 2;
-            if (markerIdx >= 0 && markerIdx < _manifest.Markers.Count)
+            if (text == FullSession)
             {
-                var offset = _manifest.Markers[markerIdx].OffsetSec;
-                _numStartSec.Value = (decimal)Math.Max(0.0, offset - 120.0);
-                _numEndSec.Value = (decimal)Math.Min(totalDurationSec, offset + 120.0);
+                _numStartSec.Value = 0;
+                _numEndSec.Value = (decimal)totalDurationSec;
             }
+            else if (text == LastFiveMinutes)
+            {
+                _numStartSec.Value = (decimal)Math.Max(0.0, totalDurationSec - 300.0);
+                _numEndSec.Value = (decimal)totalDurationSec;
+            }
+            else if (text.StartsWith(MarkerPrefix, StringComparison.Ordinal))
+            {
+                var markerIdx = _cmbPreset.SelectedIndex - 2;
+                if (markerIdx >= 0 && markerIdx < _manifest.Markers.Count)
+                {
+                    var offset = _manifest.Markers[markerIdx].OffsetSec;
+                    _numStartSec.Value = (decimal)Math.Max(0.0, offset - 120.0);
+                    _numEndSec.Value = (decimal)Math.Min(totalDurationSec, offset + 120.0);
+                }
+            }
+        }
+        finally
+        {
+            _updatingFromPreset = false;
+        }
+
+        _lblStartTime.Text = FormatTime((double)_numStartSec.Value);
+        _lblEndTime.Text = FormatTime((double)_numEndSec.Value);
+    }
+
+    private void SyncDestinationExtension()
+    {
+        var path = _txtDest.Text.Trim();
+        if (string.IsNullOrEmpty(path))
+        {
+            return;
+        }
+
+        var extension = _format.SelectedIndex == 1 ? ".mkv" : ".mp4";
+        var current = Path.GetExtension(path);
+        if (string.Equals(current, ".mp4", StringComparison.OrdinalIgnoreCase) || string.Equals(current, ".mkv", StringComparison.OrdinalIgnoreCase))
+        {
+            _txtDest.Text = Path.ChangeExtension(path, extension);
+        }
+    }
+
+    private void BrowseDestination()
+    {
+        var isMp4 = _format.SelectedIndex == 0;
+        using var sfd = new SaveFileDialog
+        {
+            Filter = isMp4 ? "MP4 Video (*.mp4)|*.mp4" : "Matroska Video (*.mkv)|*.mkv",
+            FileName = Path.GetFileName(_txtDest.Text),
+            InitialDirectory = Path.GetDirectoryName(_txtDest.Text)
+        };
+        if (sfd.ShowDialog(this) == DialogResult.OK)
+        {
+            _txtDest.Text = sfd.FileName;
         }
     }
 
@@ -193,24 +274,27 @@ public sealed class ClipExportForm : Form
         var end = (double)_numEndSec.Value;
         if (end <= start)
         {
-            MessageBox.Show(this, "End time must be greater than start time.", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            ModernDialog.Warning(this, "Check the range", "The end time must be later than the start time.");
             return;
         }
 
         var dest = _txtDest.Text.Trim();
         if (string.IsNullOrEmpty(dest))
         {
-            MessageBox.Show(this, "Please choose a destination file path.", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            ModernDialog.Warning(this, "Choose where to save", "Enter a file name or click Browse.");
             return;
         }
 
         _btnExport.Enabled = false;
         _btnPlay.Enabled = false;
         _btnShowInFolder.Enabled = false;
+        _progressBar.Visible = true;
+        _progressBar.Tone = Tone.Accent;
         _progressBar.Value = 10;
         _lblStatus.Text = "Exporting clip…";
+        _lblStatus.Tone = TextTone.Secondary;
 
-        var format = _cmbFormat.SelectedIndex == 1 ? OutputContainerFormat.Mkv : OutputContainerFormat.Mp4;
+        var format = _format.SelectedIndex == 1 ? OutputContainerFormat.Mkv : OutputContainerFormat.Mp4;
         var options = new ClipExportOptions(
             _manifest.SessionId,
             start,
@@ -221,34 +305,56 @@ public sealed class ClipExportForm : Form
 
         var progress = new Progress<double>(pct =>
         {
-            _progressBar.Value = (int)Math.Clamp(pct * 100, 0, 100);
+            if (!IsDisposed)
+            {
+                _progressBar.Value = (int)Math.Clamp(pct * 100, 0, 100);
+            }
         });
+
+        _exportCts?.Dispose();
+        _exportCts = new CancellationTokenSource();
 
         try
         {
-            var result = await _clipExporter.ExportClipAsync(options, progress).ConfigureAwait(true);
+            var result = await _clipExporter.ExportClipAsync(options, progress, _exportCts.Token).ConfigureAwait(true);
+            if (IsDisposed)
+            {
+                return;
+            }
+
             if (result.Success && !string.IsNullOrEmpty(result.FilePath))
             {
                 _exportedFilePath = result.FilePath;
                 _progressBar.Value = 100;
-                _lblStatus.Text = "✔ Clip exported successfully!";
+                _progressBar.Tone = Tone.Success;
+                _lblStatus.Text = $"Clip saved as {Path.GetFileName(result.FilePath)}";
+                _lblStatus.Tone = TextTone.Success;
                 _btnPlay.Enabled = true;
                 _btnShowInFolder.Enabled = true;
             }
             else
             {
                 _lblStatus.Text = $"Export failed: {result.ErrorMessage}";
-                MessageBox.Show(this, $"Export failed: {result.ErrorMessage}", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                _lblStatus.Tone = TextTone.Danger;
+                ModernDialog.Error(this, "Export failed", result.ErrorMessage ?? "The clip could not be exported.");
             }
         }
         catch (Exception ex)
         {
-            _lblStatus.Text = $"Export error: {ex.Message}";
-            MessageBox.Show(this, $"Export error: {ex.Message}", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Log.Warning(ex, "Clip export failed.");
+            if (!IsDisposed)
+            {
+                _lblStatus.Text = $"Export error: {ex.Message}";
+                _lblStatus.Tone = TextTone.Danger;
+                ModernDialog.Error(this, "Export failed", ex.Message);
+            }
         }
         finally
         {
-            _btnExport.Enabled = true;
+            if (!IsDisposed)
+            {
+                _btnExport.Enabled = true;
+            }
         }
     }
 }

@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using ScreenVault.App.Platform;
+using ScreenVault.App.UI.Controls;
+using ScreenVault.App.UI.Theming;
 using ScreenVault.Core.PostProcessing;
 using ScreenVault.Core.Sessions;
 using ScreenVault.Core.Settings;
@@ -9,29 +11,34 @@ using Serilog;
 
 namespace ScreenVault.App.UI;
 
-public sealed class SavedDialog : Form
+/// <summary>Shown after a recording stops: name it, play it, or copy/move it somewhere else.</summary>
+public sealed class SavedDialog : ModernForm
 {
     private SessionManifest _manifest;
     private readonly ISettingsService _settingsService;
     private readonly ISessionStore? _sessionStore;
     private readonly PlayerLauncher _playerLauncher;
 
-    private readonly TextBox _txtTitle;
-    private readonly Label _lblFileName;
+    private readonly GlyphBadge _badge;
+    private readonly TextLabel _lblHeadline;
+    private readonly TextLabel _lblSubtitle;
+    private readonly TextField _txtTitle;
+    private readonly TextLabel _lblFileName;
     private readonly PathEllipsisLabel _lblLocation;
-    private readonly Label _lblStats;
-    private readonly Label _lblStatus;
-    private readonly Button _btnPlay;
-    private readonly Button _btnShowInFolder;
-    private readonly Button _btnSaveCopy;
-    private readonly Button _btnMoveTo;
-    private readonly Button _btnRename;
-    private readonly Button _btnClose;
-    private readonly ProgressBar _progressBar;
+    private readonly TextLabel _lblStats;
+    private readonly TextLabel _lblStatus;
+    private readonly ModernButton _btnPlay;
+    private readonly ModernButton _btnShowInFolder;
+    private readonly ModernButton _btnSaveCopy;
+    private readonly ModernButton _btnMoveTo;
+    private readonly ModernButton _btnRename;
+    private readonly ModernButton _btnClose;
+    private readonly ModernProgressBar _progressBar;
     private readonly ToolTip _toolTip;
 
     private string _targetFilePath;
     private bool _isFinalizing;
+    private string? _mergeError;
 
     public SavedDialog(
         SessionManifest manifest,
@@ -44,232 +51,109 @@ public sealed class SavedDialog : Form
         _settingsService = settingsService ?? throw new ArgumentNullException(nameof(settingsService));
         _sessionStore = sessionStore;
         _playerLauncher = playerLauncher ?? new PlayerLauncher(settingsService);
-        _toolTip = new ToolTip();
+        _toolTip = ModernToolTip.Create();
 
         Text = "ScreenVault – Recording Saved";
-        var appIcon = AppIcon.Get();
-        if (appIcon != null) Icon = appIcon;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(580, 380);
+        ClientSize = new Size(600, 452);
         TopMost = true;
         KeyPreview = true;
 
         // Resolve saved file path
         _targetFilePath = ResolveSavedFilePath(_manifest);
 
-        // Header
-        var lblHeader = new Label
-        {
-            Location = new Point(20, 16),
-            Size = new Size(540, 26),
-            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
-            ForeColor = Color.FromArgb(30, 142, 62),
-            Text = "✔ Recording Saved",
-            UseMnemonic = false
-        };
+        // ── Header ───────────────────────────────────────────────────────────────────
+        _badge = new GlyphBadge { Glyph = Glyphs.CheckMark, Tone = Tone.Success, Filled = true, Bounds = new Rectangle(28, 26, 44, 44) };
+        _lblHeadline = new TextLabel("Recording saved", Typography.Title) { Location = new Point(84, 24) };
+        _lblSubtitle = new TextLabel(string.Empty, Typography.Body, TextTone.Secondary) { AutoSize = false, AutoEllipsis = true, Bounds = new Rectangle(86, 52, 486, 20) };
 
-        // Title row
-        var lblTitlePrompt = new Label
+        // ── Title ────────────────────────────────────────────────────────────────────
+        var lblTitlePrompt = new TextLabel("Title", Typography.BodyStrong) { Location = new Point(28, 96) };
+        _txtTitle = new TextField
         {
-            Location = new Point(20, 52),
-            Size = new Size(95, 22),
-            Font = new Font("Segoe UI", 9f),
-            Text = "Session Title:",
-            UseMnemonic = false
+            Bounds = new Rectangle(28, 120, 432, 34),
+            Text = _manifest.Title ?? string.Empty,
+            PlaceholderText = "Add a title so it's easy to find later",
+            LeadingGlyph = Glyphs.Rename
         };
-
-        _txtTitle = new TextBox
+        _txtTitle.Inner.KeyDown += (_, e) =>
         {
-            Location = new Point(120, 50),
-            Size = new Size(340, 25),
-            Font = new Font("Segoe UI", 9f),
-            Text = _manifest.Title ?? string.Empty
+            if (e.KeyCode == Keys.Enter)
+            {
+                OnRenameClicked(this, EventArgs.Empty);
+                e.Handled = e.SuppressKeyPress = true;
+            }
         };
-
-        _btnRename = new Button
-        {
-            Location = new Point(470, 49),
-            Size = new Size(90, 27),
-            Font = new Font("Segoe UI", 9f),
-            Text = "Rename",
-            UseMnemonic = false
-        };
+        _btnRename = new ModernButton("Rename", ButtonKind.Secondary) { Bounds = new Rectangle(468, 120, 104, 34) };
         _btnRename.Click += OnRenameClicked;
-        _toolTip.SetToolTip(_btnRename, "Rename recording with new title");
+        _toolTip.SetToolTip(_btnRename, "Save the title (Enter)");
 
-        // Dedicated Info Labels: File, Location (with PathEllipsis), Stats, Status
-        var lblFilePrompt = new Label
-        {
-            Location = new Point(20, 88),
-            Size = new Size(75, 20),
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            Text = "File:",
-            UseMnemonic = false
-        };
-
-        _lblFileName = new Label
-        {
-            Location = new Point(95, 88),
-            Size = new Size(465, 20),
-            Font = new Font("Segoe UI", 9f),
-            AutoEllipsis = true,
-            UseMnemonic = false
-        };
-
-        var lblLocationPrompt = new Label
-        {
-            Location = new Point(20, 114),
-            Size = new Size(75, 20),
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            Text = "Location:",
-            UseMnemonic = false
-        };
-
-        _lblLocation = new PathEllipsisLabel
-        {
-            Location = new Point(95, 114),
-            Size = new Size(465, 20),
-            Font = new Font("Segoe UI", 9f),
-            Cursor = Cursors.Hand,
-            UseMnemonic = false
-        };
+        // ── File details ─────────────────────────────────────────────────────────────
+        var infoCard = new CardPanel { ManualLayout = true, Bounds = new Rectangle(28, 172, 544, 150) };
+        infoCard.Controls.Add(new TextLabel("File", Typography.Caption, TextTone.Tertiary) { Location = new Point(16, 14) });
+        _lblFileName = new TextLabel(string.Empty, Typography.BodyStrong) { AutoSize = false, AutoEllipsis = true, Bounds = new Rectangle(16, 32, 512, 20) };
+        infoCard.Controls.Add(new TextLabel("Location", Typography.Caption, TextTone.Tertiary) { Location = new Point(16, 62) });
+        _lblLocation = new PathEllipsisLabel { Bounds = new Rectangle(16, 80, 512, 20), Cursor = Cursors.Hand };
+        _lblLocation.Click += (_, _) => RevealFolder();
 
         var infoMenu = new ContextMenuStrip();
-        infoMenu.Items.Add("Copy path", null, (_, _) =>
+        ModernMenu.Apply(infoMenu);
+        infoMenu.Items.Add(ModernMenu.Item("Copy folder path", Glyphs.Copy, (_, _) =>
         {
             var dir = GetNormalizedLocation();
             if (!string.IsNullOrEmpty(dir))
             {
                 Clipboard.SetText(dir);
             }
-        });
-        infoMenu.Items.Add("Copy Full File Path", null, (_, _) =>
+        }));
+        infoMenu.Items.Add(ModernMenu.Item("Copy full file path", Glyphs.Copy, (_, _) =>
         {
             if (!string.IsNullOrEmpty(_targetFilePath))
             {
                 Clipboard.SetText(_targetFilePath);
             }
-        });
+        }));
         _lblLocation.ContextMenuStrip = infoMenu;
+        Disposed += (_, _) => infoMenu.Dispose();
 
-        _lblStats = new Label
-        {
-            Location = new Point(20, 142),
-            Size = new Size(540, 42),
-            Font = new Font("Segoe UI", 9f),
-            UseMnemonic = false
-        };
+        _lblStats = new TextLabel(string.Empty, Typography.Body, TextTone.Secondary) { AutoSize = false, AutoEllipsis = true, Bounds = new Rectangle(16, 114, 512, 20) };
+        infoCard.Controls.AddRange([_lblFileName, _lblLocation, _lblStats]);
 
-        _lblStatus = new Label
-        {
-            Location = new Point(20, 190),
-            Size = new Size(540, 22),
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Italic),
-            ForeColor = Color.DimGray,
-            UseMnemonic = false
-        };
+        // ── Progress / status ────────────────────────────────────────────────────────
+        _lblStatus = new TextLabel(string.Empty, Typography.Caption, TextTone.Secondary) { AutoSize = false, AutoEllipsis = true, Bounds = new Rectangle(28, 334, 544, 18) };
+        _progressBar = new ModernProgressBar { Bounds = new Rectangle(28, 356, 544, 6), Visible = false };
 
-        _progressBar = new ProgressBar
-        {
-            Location = new Point(20, 218),
-            Size = new Size(540, 14),
-            Visible = false
-        };
-
-        // Action Buttons Row inside FlowLayoutPanel to avoid clipping
-        var pnlButtons = new FlowLayoutPanel
-        {
-            Location = new Point(16, 246),
-            Size = new Size(548, 48),
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = true,
-            AutoSize = true
-        };
-
-        _btnPlay = new Button
-        {
-            AutoSize = true,
-            MinimumSize = new Size(88, 34),
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            Text = "▶ Play",
-            Margin = new Padding(3, 3, 5, 3),
-            UseMnemonic = false
-        };
-        _btnPlay.Click += (_, _) => _playerLauncher.Launch(_targetFilePath);
-        _toolTip.SetToolTip(_btnPlay, "Play the final recording");
-
-        _btnShowInFolder = new Button
-        {
-            AutoSize = true,
-            MinimumSize = new Size(116, 34),
-            Font = new Font("Segoe UI", 9f),
-            Text = "Show in Folder",
-            Margin = new Padding(3, 3, 5, 3),
-            UseMnemonic = false
-        };
+        // ── Footer ───────────────────────────────────────────────────────────────────
+        var footer = new SurfacePanel { Size = new Size(600, 68), Dock = DockStyle.Bottom, TopDivider = true };
+        var secondaryActions = new FlowLayoutPanel { Bounds = new Rectangle(16, 16, 360, 40), WrapContents = false };
+        _btnShowInFolder = FooterAction(secondaryActions, "Show in folder", Glyphs.FolderOpen, "Show in folder (Ctrl+O)");
         _btnShowInFolder.Click += (_, _) => RevealFolder();
-        _toolTip.SetToolTip(_btnShowInFolder, "Show in Folder (Ctrl+O)");
-
-        _btnSaveCopy = new Button
-        {
-            AutoSize = true,
-            MinimumSize = new Size(116, 34),
-            Font = new Font("Segoe UI", 9f),
-            Text = "Save Copy As…",
-            Margin = new Padding(3, 3, 5, 3),
-            UseMnemonic = false
-        };
+        _btnSaveCopy = FooterAction(secondaryActions, "Save copy…", Glyphs.Copy, "Save a copy of the video somewhere else");
         _btnSaveCopy.Click += async (_, _) => await OnSaveCopyClickedAsync(isMove: false);
-        _toolTip.SetToolTip(_btnSaveCopy, "Save a copy of the video to another location");
-
-        _btnMoveTo = new Button
-        {
-            AutoSize = true,
-            MinimumSize = new Size(95, 34),
-            Font = new Font("Segoe UI", 9f),
-            Text = "Move To…",
-            Margin = new Padding(3, 3, 5, 3),
-            UseMnemonic = false
-        };
+        _btnMoveTo = FooterAction(secondaryActions, "Move…", Glyphs.Move, "Move the video file to another folder");
         _btnMoveTo.Click += async (_, _) => await OnSaveCopyClickedAsync(isMove: true);
-        _toolTip.SetToolTip(_btnMoveTo, "Move the video file to another location");
 
-        _btnClose = new Button
-        {
-            AutoSize = true,
-            MinimumSize = new Size(82, 34),
-            Font = new Font("Segoe UI", 9f),
-            Text = "Close",
-            Margin = new Padding(3, 3, 3, 3),
-            UseMnemonic = false
-        };
+        _btnClose = new ModernButton("Close", ButtonKind.Secondary) { Bounds = new Rectangle(384, 18, 88, 32) };
         _btnClose.Click += (_, _) => Close();
         _toolTip.SetToolTip(_btnClose, "Close (Esc)");
+        _btnPlay = new ModernButton("Play", ButtonKind.Primary, Glyphs.Play) { Bounds = new Rectangle(480, 18, 96, 32) };
+        _btnPlay.Click += (_, _) => _playerLauncher.Launch(_targetFilePath);
+        _toolTip.SetToolTip(_btnPlay, "Play the final recording");
+        footer.Controls.AddRange([secondaryActions, _btnClose, _btnPlay]);
 
-        pnlButtons.Controls.Add(_btnPlay);
-        pnlButtons.Controls.Add(_btnShowInFolder);
-        pnlButtons.Controls.Add(_btnSaveCopy);
-        pnlButtons.Controls.Add(_btnMoveTo);
-        pnlButtons.Controls.Add(_btnClose);
+        Controls.AddRange([_badge, _lblHeadline, _lblSubtitle, lblTitlePrompt, _txtTitle, _btnRename, infoCard, _lblStatus, _progressBar, footer]);
 
-        Controls.Add(lblHeader);
-        Controls.Add(lblTitlePrompt);
-        Controls.Add(_txtTitle);
-        Controls.Add(_btnRename);
-        Controls.Add(lblFilePrompt);
-        Controls.Add(_lblFileName);
-        Controls.Add(lblLocationPrompt);
-        Controls.Add(_lblLocation);
-        Controls.Add(_lblStats);
-        Controls.Add(_lblStatus);
-        Controls.Add(_progressBar);
-        Controls.Add(pnlButtons);
+        // Come to the front once so the user sees it, but don't stay above other apps afterwards.
+        Shown += (_, _) =>
+        {
+            Activate();
+            TopMost = false;
+        };
 
-        KeyDown += (s, e) =>
+        KeyDown += (_, e) =>
         {
             if (e.KeyCode == Keys.Escape)
             {
@@ -282,29 +166,30 @@ public sealed class SavedDialog : Form
             }
         };
 
+        ResumeLayout(false);
+        PerformLayout();
+
         // Check if finalizing in background
         if (finalizeTask != null && !finalizeTask.IsCompleted)
         {
             _isFinalizing = true;
-            _progressBar.Style = ProgressBarStyle.Marquee;
+            _progressBar.Marquee = true;
             _progressBar.Visible = true;
-            _btnPlay.Enabled = false;
-            _btnShowInFolder.Enabled = false;
-            _btnSaveCopy.Enabled = false;
-            _btnMoveTo.Enabled = false;
+            SetFileActionsEnabled(false);
             UpdateInfoDisplay();
 
-            _ = finalizeTask.ContinueWith(t =>
+            _ = finalizeTask.ContinueWith(task =>
             {
+                var mergeResult = task.IsCompletedSuccessfully ? task.Result : null;
                 if (!IsDisposed)
                 {
                     try
                     {
-                        BeginInvoke(OnFinalizationComplete);
+                        BeginInvoke(() => OnFinalizationComplete(mergeResult));
                     }
-                    catch
+                    catch (InvalidOperationException)
                     {
-                        // Handle disposed form
+                        // Form was closed before finalization finished.
                     }
                 }
             }, TaskScheduler.Default);
@@ -313,12 +198,43 @@ public sealed class SavedDialog : Form
         {
             _isFinalizing = false;
             UpdateInfoDisplay();
-            var hasFile = File.Exists(_targetFilePath);
-            _btnPlay.Enabled = hasFile;
-            _btnShowInFolder.Enabled = hasFile || Directory.Exists(GetNormalizedLocation());
-            _btnSaveCopy.Enabled = hasFile;
-            _btnMoveTo.Enabled = hasFile;
+            UpdateFileActions();
         }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _toolTip.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    private ModernButton FooterAction(FlowLayoutPanel host, string text, char glyph, string tooltip)
+    {
+        var button = new ModernButton(text, ButtonKind.Subtle, glyph) { AutoSize = true, Margin = new Padding(0, 2, 4, 0) };
+        _toolTip.SetToolTip(button, tooltip);
+        host.Controls.Add(button);
+        return button;
+    }
+
+    private void SetFileActionsEnabled(bool enabled)
+    {
+        _btnPlay.Enabled = enabled;
+        _btnShowInFolder.Enabled = enabled;
+        _btnSaveCopy.Enabled = enabled;
+        _btnMoveTo.Enabled = enabled;
+    }
+
+    private void UpdateFileActions()
+    {
+        var hasFile = File.Exists(_targetFilePath);
+        _btnPlay.Enabled = hasFile;
+        _btnShowInFolder.Enabled = hasFile || Directory.Exists(GetNormalizedLocation());
+        _btnSaveCopy.Enabled = hasFile;
+        _btnMoveTo.Enabled = hasFile;
     }
 
     private void RevealFolder()
@@ -337,11 +253,13 @@ public sealed class SavedDialog : Form
         }
     }
 
-    private void OnFinalizationComplete()
+    private void OnFinalizationComplete(MergeResult? mergeResult)
     {
         if (IsDisposed) return;
 
         _isFinalizing = false;
+        _mergeError = mergeResult is { Success: false } ? mergeResult.ErrorMessage ?? "unknown error" : null;
+        _progressBar.Marquee = false;
         _progressBar.Visible = false;
 
         // Reload manifest from store to pick up merged file and remux statuses
@@ -356,12 +274,7 @@ public sealed class SavedDialog : Form
 
         _targetFilePath = ResolveSavedFilePath(_manifest);
         UpdateInfoDisplay();
-
-        var hasFile = File.Exists(_targetFilePath);
-        _btnPlay.Enabled = hasFile;
-        _btnShowInFolder.Enabled = hasFile || Directory.Exists(GetNormalizedLocation());
-        _btnSaveCopy.Enabled = hasFile;
-        _btnMoveTo.Enabled = hasFile;
+        UpdateFileActions();
     }
 
     private string GetNormalizedLocation()
@@ -387,25 +300,42 @@ public sealed class SavedDialog : Form
 
         var location = GetNormalizedLocation();
         var fileName = _isFinalizing
-            ? "Finalizing… (remuxing && merging)"
+            ? "Finalizing… (converting and merging parts)"
             : (!string.IsNullOrEmpty(_targetFilePath) ? Path.GetFileName(_targetFilePath) : "Finalizing…");
 
         _lblFileName.Text = fileName;
         _lblLocation.Text = location;
-        _toolTip.SetToolTip(_lblLocation, !string.IsNullOrEmpty(_targetFilePath) ? _targetFilePath : location);
+        _toolTip.SetToolTip(_lblLocation, (!string.IsNullOrEmpty(_targetFilePath) ? _targetFilePath : location) + Environment.NewLine + "Click to show in Explorer · right-click to copy the path");
 
-        _lblStats.Text = $"Duration: {duration:hh\\:mm\\:ss}   |   Size: {mb:F1} MB\n" +
-                         $"Parts: {_manifest.Segments.Count}   |   Markers: {_manifest.Markers.Count}";
+        var size = mb >= 1024 ? string.Create(CultureInfo.CurrentCulture, $"{mb / 1024.0:F2} GB") : string.Create(CultureInfo.CurrentCulture, $"{mb:F1} MB");
+        _lblStats.Text = $"{duration.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture)} long  ·  {size}  ·  {_manifest.Segments.Count} part{(_manifest.Segments.Count == 1 ? string.Empty : "s")}  ·  {_manifest.Markers.Count} marker{(_manifest.Markers.Count == 1 ? string.Empty : "s")}";
 
         if (_isFinalizing)
         {
-            _lblStatus.Text = "Finalizing… (remuxing && merging)";
-            _lblStatus.Visible = true;
+            _badge.Glyph = Glyphs.Save;
+            _badge.Tone = Tone.Accent;
+            _lblHeadline.Text = "Saving your recording…";
+            _lblSubtitle.Text = "Converting and merging parts. You can close this window — it continues in the background.";
+            _lblStatus.Text = "Finalizing… (converting and merging parts)";
+            _lblStatus.Tone = TextTone.Secondary;
         }
         else
         {
-            _lblStatus.Text = string.Empty;
-            _lblStatus.Visible = false;
+            _badge.Glyph = Glyphs.CheckMark;
+            _badge.Tone = Tone.Success;
+            _lblHeadline.Text = "Recording saved";
+            _lblSubtitle.Text = File.Exists(_targetFilePath) ? "Everything is safely on disk." : "The file will appear once post-processing finishes.";
+            if (_mergeError != null)
+            {
+                // The parts are all there; only joining them into one file failed.
+                _lblStatus.Text = "The parts couldn't be joined into one file, so they were kept as separate files. You can try again from Recordings → Merge parts.";
+                _lblStatus.Tone = TextTone.Warning;
+                _toolTip.SetToolTip(_lblStatus, _mergeError);
+            }
+            else
+            {
+                _lblStatus.Text = string.Empty;
+            }
         }
     }
 
@@ -424,10 +354,9 @@ public sealed class SavedDialog : Form
             var expLocation = Path.GetFullPath(Environment.ExpandEnvironmentVariables(lastSeg.Location));
             if (!string.IsNullOrEmpty(lastSeg.FinalPath))
             {
-                var final = Path.IsPathRooted(lastSeg.FinalPath)
+                return Path.IsPathRooted(lastSeg.FinalPath)
                     ? lastSeg.FinalPath
                     : Path.GetFullPath(Path.Combine(expLocation, lastSeg.FinalPath));
-                return final;
             }
 
             if (!string.IsNullOrEmpty(lastSeg.TsPath))
@@ -449,27 +378,92 @@ public sealed class SavedDialog : Form
 
     private void OnRenameClicked(object? sender, EventArgs e)
     {
+        // The title is a display name: keep it as typed (file names are made safe where they're built).
         var newTitle = _txtTitle.Text.Trim();
         if (string.IsNullOrWhiteSpace(newTitle)) return;
+        if (newTitle.Length > 120) newTitle = newTitle[..120].TrimEnd();
 
-        // Sanitize title
-        var invalid = Path.GetInvalidFileNameChars();
-        var sanitized = string.Concat(newTitle.Select(c => invalid.Contains(c) ? '-' : c))
-            .Replace(" ", "-");
-        if (sanitized.Length > 60) sanitized = sanitized[..60];
-
-        _manifest.Title = sanitized;
-        _sessionStore?.Save(_manifest);
+        try
+        {
+            // Atomic update: merging may be saving the same session in the background right now.
+            _sessionStore?.Update(_manifest.SessionId, m =>
+            {
+                m.Title = newTitle;
+                return true;
+            });
+            _manifest.Title = newTitle;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Could not save the recording title.");
+            ModernDialog.Error(this, "Could not save the title", ex.Message);
+            return;
+        }
 
         UpdateInfoDisplay();
-        MessageBox.Show(this, $"Session title updated to:\n{sanitized}", "Session Renamed", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        _lblStatus.Text = $"Title saved as \"{newTitle}\".";
+        _lblStatus.Tone = TextTone.Success;
+    }
+
+    private async Task CopyWithProgressAsync(string sourcePath, string destPath, long totalBytes)
+    {
+        var buffer = new byte[4 * 1024 * 1024]; // 4 MB buffer
+        await using var srcStream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, buffer.Length, useAsync: true);
+        await using var destStream = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, buffer.Length, useAsync: true);
+
+        long copiedBytes = 0;
+        int read;
+        while ((read = await srcStream.ReadAsync(buffer).ConfigureAwait(false)) > 0)
+        {
+            await destStream.WriteAsync(buffer.AsMemory(0, read)).ConfigureAwait(false);
+            copiedBytes += read;
+            var percent = totalBytes > 0 ? (int)(copiedBytes * 100 / totalBytes) : 0;
+            if (!IsDisposed && IsHandleCreated)
+            {
+                BeginInvoke(() => _progressBar.Value = Math.Clamp(percent, 0, 100));
+            }
+        }
+    }
+
+    /// <summary>Points the session at the file's new place so Recordings can still play it.</summary>
+    private void RememberMovedFile(string oldPath, string newPath)
+    {
+        try
+        {
+            _sessionStore?.Update(_manifest.SessionId, m =>
+            {
+                if (!string.IsNullOrEmpty(m.MergedPath) &&
+                    string.Equals(Path.GetFullPath(Environment.ExpandEnvironmentVariables(m.MergedPath)), oldPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    m.MergedPath = newPath;
+                    return true;
+                }
+
+                foreach (var segment in m.Segments)
+                {
+                    var location = Path.GetFullPath(Environment.ExpandEnvironmentVariables(segment.Location));
+                    var finalPath = string.IsNullOrEmpty(segment.FinalPath) ? null : Path.GetFullPath(Path.Combine(location, segment.FinalPath));
+                    if (finalPath != null && string.Equals(finalPath, oldPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        segment.FinalPath = newPath;
+                        return true;
+                    }
+                }
+
+                return false;
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Could not update the session after moving {Path}", oldPath);
+        }
     }
 
     private async Task OnSaveCopyClickedAsync(bool isMove)
     {
         if (!File.Exists(_targetFilePath))
         {
-            MessageBox.Show(this, "The target video file is not yet available.", "ScreenVault", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            ModernDialog.Warning(this, "The video isn't ready yet", "Wait until finalizing has finished, then try again.");
             return;
         }
 
@@ -483,70 +477,90 @@ public sealed class SavedDialog : Form
         if (sfd.ShowDialog(this) != DialogResult.OK) return;
 
         var destPath = sfd.FileName;
-        _progressBar.Visible = true;
-        _progressBar.Style = ProgressBarStyle.Blocks;
-        _progressBar.Value = 0;
+        if (string.Equals(Path.GetFullPath(destPath), Path.GetFullPath(_targetFilePath), StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
 
+        _progressBar.Marquee = false;
+        _progressBar.Value = 0;
+        _progressBar.Visible = true;
+        _lblStatus.Text = isMove ? "Moving…" : "Copying…";
+        _lblStatus.Tone = TextTone.Secondary;
+        SetFileActionsEnabled(false);
+
+        var sourcePath = _targetFilePath;
         try
         {
-            var srcFi = new FileInfo(_targetFilePath);
-            var totalBytes = srcFi.Length;
-            long copiedBytes = 0;
+            var totalBytes = new FileInfo(sourcePath).Length;
 
-            await Task.Run(async () =>
+            // Same drive: a move is just a rename, no need to copy gigabytes.
+            var sameVolume = string.Equals(
+                Path.GetPathRoot(Path.GetFullPath(destPath)),
+                Path.GetPathRoot(Path.GetFullPath(sourcePath)),
+                StringComparison.OrdinalIgnoreCase);
+
+            if (isMove && sameVolume)
             {
-                var buffer = new byte[4 * 1024 * 1024]; // 4 MB buffer
-                await using var srcStream = new FileStream(_targetFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, buffer.Length, useAsync: true);
-                await using var destStream = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, buffer.Length, useAsync: true);
-
-                int read;
-                while ((read = await srcStream.ReadAsync(buffer).ConfigureAwait(false)) > 0)
-                {
-                    await destStream.WriteAsync(buffer.AsMemory(0, read)).ConfigureAwait(false);
-                    copiedBytes += read;
-                    var percent = totalBytes > 0 ? (int)(copiedBytes * 100 / totalBytes) : 0;
-                    Invoke(() => _progressBar.Value = Math.Clamp(percent, 0, 100));
-                }
-            });
-
-            if (isMove)
+                await Task.Run(() => File.Move(sourcePath, destPath, overwrite: true));
+            }
+            else
             {
-                try
+                await Task.Run(() => CopyWithProgressAsync(sourcePath, destPath, totalBytes));
+
+                if (isMove)
                 {
-                    File.Delete(_targetFilePath);
-                    _targetFilePath = destPath;
-                    UpdateInfoDisplay();
-                }
-                catch (Exception ex)
-                {
-                    Log.Warning(ex, "Could not delete original file after move.");
+                    try
+                    {
+                        File.Delete(sourcePath);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning(ex, "Could not delete original file after move.");
+                    }
                 }
             }
 
-            MessageBox.Show(this, $"File successfully {(isMove ? "moved" : "copied")} to:\n{destPath}", "Done", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            if (isMove)
+            {
+                _targetFilePath = destPath;
+                RememberMovedFile(sourcePath, destPath);
+                UpdateInfoDisplay();
+            }
+
+            _lblStatus.Text = $"{(isMove ? "Moved" : "Copied")} to {destPath}";
+            _lblStatus.Tone = TextTone.Success;
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, $"Failed to {(isMove ? "move" : "copy")} file:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Log.Warning(ex, "Save copy / move failed.");
+            ModernDialog.Error(this, $"Could not {(isMove ? "move" : "copy")} the file", ex.Message);
+            _lblStatus.Text = string.Empty;
         }
         finally
         {
             _progressBar.Visible = false;
+            UpdateFileActions();
         }
     }
 }
 
-internal sealed class PathEllipsisLabel : Label
+/// <summary>Label that shortens long paths in the middle ("C:\Users\…\Screen Recordings").</summary>
+internal sealed class PathEllipsisLabel : Label, IThemeAware
 {
     public PathEllipsisLabel()
     {
         UseMnemonic = false;
         AutoEllipsis = true;
+        Font = Typography.Body;
+        ApplyTheme();
     }
+
+    public void ApplyTheme() => ForeColor = Theme.Current.Text;
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        var flags = TextFormatFlags.PathEllipsis | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine;
+        var flags = TextFormatFlags.PathEllipsis | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
         TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ForeColor, flags);
     }
 }

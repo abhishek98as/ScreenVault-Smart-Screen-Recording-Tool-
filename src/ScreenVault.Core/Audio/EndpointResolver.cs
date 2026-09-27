@@ -55,7 +55,7 @@ public static class EndpointResolver
         {
             try
             {
-                var device = enumerator.GetDevice(settings.MicDeviceId);
+                using var device = enumerator.GetDevice(settings.MicDeviceId);
                 if (device is { State: DeviceState.Active })
                 {
                     return new ResolvedEndpoint(device.ID, device.FriendlyName, false);
@@ -73,7 +73,7 @@ public static class EndpointResolver
         var role = settings.MicMode == MicMode.DefaultMultimedia ? Role.Multimedia : Role.Communications;
         try
         {
-            var defaultMic = enumerator.GetDefaultAudioEndpoint(DataFlow.Capture, role);
+            using var defaultMic = enumerator.GetDefaultAudioEndpoint(DataFlow.Capture, role);
             if (defaultMic != null)
             {
                 var isFallback = settings.MicMode == MicMode.Specific;
@@ -86,7 +86,7 @@ public static class EndpointResolver
             var altRole = role == Role.Communications ? Role.Multimedia : Role.Communications;
             try
             {
-                var altMic = enumerator.GetDefaultAudioEndpoint(DataFlow.Capture, altRole);
+                using var altMic = enumerator.GetDefaultAudioEndpoint(DataFlow.Capture, altRole);
                 if (altMic != null)
                 {
                     return new ResolvedEndpoint(altMic.ID, altMic.FriendlyName, false, true);
@@ -117,7 +117,7 @@ public static class EndpointResolver
         {
             try
             {
-                var device = enumerator.GetDevice(settings.OutputDeviceId);
+                using var device = enumerator.GetDevice(settings.OutputDeviceId);
                 if (device is { State: DeviceState.Active })
                 {
                     results.Add(new ResolvedEndpoint(device.ID, device.FriendlyName, true));
@@ -139,7 +139,10 @@ public static class EndpointResolver
                 var devices = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active);
                 foreach (var dev in devices)
                 {
-                    results.Add(new ResolvedEndpoint(dev.ID, dev.FriendlyName, true));
+                    using (dev)
+                    {
+                        results.Add(new ResolvedEndpoint(dev.ID, dev.FriendlyName, true));
+                    }
                 }
                 return results;
             }
@@ -152,7 +155,7 @@ public static class EndpointResolver
         // Default or DefaultPlusCommunications
         try
         {
-            var defMultimedia = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            using var defMultimedia = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
             if (defMultimedia != null)
             {
                 results.Add(new ResolvedEndpoint(defMultimedia.ID, defMultimedia.FriendlyName, true));
@@ -171,7 +174,7 @@ public static class EndpointResolver
         {
             try
             {
-                var defComms = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Communications);
+                using var defComms = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Communications);
                 if (defComms != null && !results.Any(r => r.Id.Equals(defComms.ID, StringComparison.OrdinalIgnoreCase)))
                 {
                     results.Add(new ResolvedEndpoint(defComms.ID, defComms.FriendlyName, true));

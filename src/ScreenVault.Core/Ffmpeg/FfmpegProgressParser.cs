@@ -82,4 +82,14 @@ public sealed class FfmpegProgressParser
 
     public FfmpegProgress CurrentProgress() =>
         new(_currentFrame, _currentFps, _currentSpeed, _currentOutTime, _currentTotalBytes);
+
+    /// <summary>Forgets the previous process' figures so watchdogs don't act on stale speed/fps.</summary>
+    public void Reset()
+    {
+        _currentFrame = 0;
+        _currentFps = 0;
+        _currentSpeed = 0;
+        _currentOutTime = TimeSpan.Zero;
+        _currentTotalBytes = 0;
+    }
 }

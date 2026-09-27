@@ -14,9 +14,28 @@ public sealed class LevelMeter
     private DateTime _lastUpdateUtc = DateTime.UtcNow;
     private DateTime _heldPeakExpiresUtc = DateTime.MinValue;
 
-    public float PeakDb => BitConverter.Int32BitsToSingle(Volatile.Read(ref _peakDbBits));
-    public float RmsDb => BitConverter.Int32BitsToSingle(Volatile.Read(ref _rmsDbBits));
-    public float HeldPeakDb => BitConverter.Int32BitsToSingle(Volatile.Read(ref _heldPeakDbBits));
+    // Loopback capture delivers no data at all while nothing is playing; without this the meters
+    // would freeze at the last level instead of falling back to silence.
+    private const double StaleAfterSeconds = 0.25;
+    private long _lastUpdateTicks = DateTime.UtcNow.Ticks;
+
+    public float PeakDb => DecayIfStale(BitConverter.Int32BitsToSingle(Volatile.Read(ref _peakDbBits)));
+    public float RmsDb => IsStale(out _) ? SilenceFloorDb : BitConverter.Int32BitsToSingle(Volatile.Read(ref _rmsDbBits));
+    public float HeldPeakDb => DecayIfStale(BitConverter.Int32BitsToSingle(Volatile.Read(ref _heldPeakDbBits)));
+
+    private bool IsStale(out double staleSeconds)
+    {
+        var last = new DateTime(Interlocked.Read(ref _lastUpdateTicks), DateTimeKind.Utc);
+        staleSeconds = (DateTime.UtcNow - last).TotalSeconds - StaleAfterSeconds;
+        return staleSeconds > 0;
+    }
+
+    private float DecayIfStale(float db)
+    {
+        return IsStale(out var staleSeconds)
+            ? Math.Max(SilenceFloorDb, db - (float)(DecayDbPerSec * 3 * staleSeconds))
+            : db;
+    }
 
     public void Update(ReadOnlySpan<float> stereoBuffer, int frames)
     {
@@ -80,6 +99,7 @@ public sealed class LevelMeter
             Interlocked.Exchange(ref _peakDbBits, BitConverter.SingleToInt32Bits(newPeak));
             Interlocked.Exchange(ref _rmsDbBits, BitConverter.SingleToInt32Bits(blockRmsDb));
             Interlocked.Exchange(ref _heldPeakDbBits, BitConverter.SingleToInt32Bits(newHeld));
+            Interlocked.Exchange(ref _lastUpdateTicks, now.Ticks);
         }
     }
 
@@ -92,6 +112,7 @@ public sealed class LevelMeter
             Interlocked.Exchange(ref _heldPeakDbBits, BitConverter.SingleToInt32Bits(SilenceFloorDb));
             _heldPeakExpiresUtc = DateTime.MinValue;
             _lastUpdateUtc = DateTime.UtcNow;
+            Interlocked.Exchange(ref _lastUpdateTicks, _lastUpdateUtc.Ticks);
         }
     }
 

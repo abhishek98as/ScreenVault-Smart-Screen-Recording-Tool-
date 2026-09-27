@@ -291,6 +291,13 @@ public sealed class SystemDiskSpaceProbe : IDiskSpaceProbe
             var root = _fileSystem.Path.GetPathRoot(expanded);
             if (string.IsNullOrEmpty(root)) return false;
 
+            // DriveInfo only understands drive letters; network shares (\\server\share) are
+            // ready when the share can be reached.
+            if (IsUncRoot(root))
+            {
+                return _fileSystem.Directory.Exists(root);
+            }
+
             var drive = _fileSystem.DriveInfo.New(root);
             return drive.IsReady;
         }
@@ -308,6 +315,12 @@ public sealed class SystemDiskSpaceProbe : IDiskSpaceProbe
             var root = _fileSystem.Path.GetPathRoot(expanded);
             if (string.IsNullOrEmpty(root)) return 0;
 
+            if (IsUncRoot(root))
+            {
+                var share = root.EndsWith('\\') ? root : root + "\\";
+                return GetDiskFreeSpaceEx(share, out var available, out _, out _) ? (long)Math.Min(available, long.MaxValue) : 0;
+            }
+
             var drive = _fileSystem.DriveInfo.New(root);
             return drive.AvailableFreeSpace;
         }
@@ -317,6 +330,13 @@ public sealed class SystemDiskSpaceProbe : IDiskSpaceProbe
             return 0;
         }
     }
+
+    private static bool IsUncRoot(string root) =>
+        root.StartsWith(@"\\", StringComparison.Ordinal) && !root.StartsWith(@"\\?\", StringComparison.Ordinal);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool GetDiskFreeSpaceEx(string lpDirectoryName, out ulong lpFreeBytesAvailable, out ulong lpTotalNumberOfBytes, out ulong lpTotalNumberOfFreeBytes);
 
     public bool TestWriteAccess(string path)
     {

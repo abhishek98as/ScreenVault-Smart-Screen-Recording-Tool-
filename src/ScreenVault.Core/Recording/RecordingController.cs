@@ -12,6 +12,12 @@ namespace ScreenVault.Core.Recording;
 
 public sealed class RecordingController : IRecordingController, IAsyncDisposable
 {
+    // FFmpeg that is running but has produced no output for this long after starting is stuck.
+    private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan HangTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DiskStallTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan NoAudioTimeout = TimeSpan.FromSeconds(10);
+
     private readonly ISettingsService _settingsService;
     private readonly IFfmpegHost _ffmpegHost;
     private readonly IAudioEngine _audioEngine;
@@ -27,28 +33,31 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
     private readonly SessionClock _sessionClock;
     private readonly List<DateTime> _memoryRestarts = new();
 
-    private RecorderState _state = RecorderState.Idle;
-    private DesiredState _desired = DesiredState.Stopped;
+    private volatile RecorderState _state = RecorderState.Idle;
+    private volatile DesiredState _desired = DesiredState.Stopped;
+    private volatile bool _disposed;
     private DateTime _sessionStartTimeUtc;
     private DateTime _sessionStartLocal;
     private bool _displayChangePending;
     private DateTime _displayChangeRequestedUtc;
     private int _encoderFailures;
     private string _activeProfileName = "x264";
-    private SessionManifest? _activeManifest;
+    private volatile SessionManifest? _activeManifest;
     private string? _activeMetadataBackupDir;
-    private bool _manifestSavedInitial;
+    private volatile bool _manifestSavedInitial;
     private int _currentPartIndex = 1;
 
+    // Watchdog state (reconcile thread only)
+    private DateTime _pipelineStartedUtc;
     private bool _memoryHighWarning;
-    private int _consecutiveLowSpeedSeconds;
+    private DateTime? _lowSpeedSinceUtc;
     private DateTime _lastWatchdogLogUtc;
     private DateTime _lastPauseReminderUtc;
     private long _lastBytesWritten;
-    private int _bytesWrittenStallSeconds;
+    private DateTime _lastBytesGrowthUtc;
     private DateTime _lastDiskSizeCheckUtc;
-    private bool _diskLengthMismatchWarning;
-    private int _zeroAudioSourcesSeconds;
+    private volatile bool _diskLengthMismatchWarning;
+    private DateTime? _noAudioSinceUtc;
     private bool _noAudioToastShown;
 
     public RecorderState State => _state;
@@ -98,18 +107,7 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
 
         if (_storageManager != null)
         {
-            _storageManager.SwitchRequested += (_, args) =>
-            {
-                Log.Information("StorageManager requested switch to {Location}. Reason: {Reason}", args.NewLocation, args.Reason);
-                _segmentSink.RequestRotation(RotationReason.StorageSwitch);
-                _markerService?.AddEvent("StorageSwitched", args.Reason);
-                _activeManifest?.Events.Add(new SessionEventEntry
-                {
-                    AtUtc = _clock.UtcNow,
-                    Type = "StorageSwitched",
-                    Detail = $"Switched to {args.NewLocation} ({args.Reason})"
-                });
-            };
+            _storageManager.SwitchRequested += OnStorageSwitchRequested;
         }
 
         _reconcileTimer = new System.Threading.Timer(_ => TriggerReconcile(), null, 1000, 1000);
@@ -158,6 +156,12 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_desired == DesiredState.Stopped)
+            {
+                Log.Information("Pause ignored: nothing is being recorded.");
+                return;
+            }
+
             Log.Information("Pause requested by user.");
             _desired = DesiredState.Paused;
             await ReconcileLockedAsync().ConfigureAwait(false);
@@ -173,8 +177,16 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_desired != DesiredState.Paused)
+            {
+                // Resuming must never start a brand-new recording nobody asked for.
+                Log.Information("Resume ignored: recording is not paused (desired state {Desired}).", _desired);
+                return;
+            }
+
             Log.Information("Resume requested by user.");
             _desired = DesiredState.Recording;
+            _backoff.Reset();
             await ReconcileLockedAsync().ConfigureAwait(false);
         }
         finally
@@ -185,29 +197,36 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
 
     public void AddMarker(string? note, string kind = "User")
     {
-        var elapsedSec = _sessionClock.Elapsed.TotalSeconds;
-        Log.Information("Marker added: {Kind} - {Note} at {Elapsed}s", kind, note, elapsedSec);
+        var manifest = _activeManifest;
+        if (manifest == null)
+        {
+            Log.Information("Marker '{Note}' ignored: no recording is active.", note);
+            return;
+        }
 
         if (_markerService != null)
         {
             _markerService.AddMarker(note ?? string.Empty, kind);
+            return;
         }
-        else if (_activeManifest != null)
+
+        var entry = new MarkerEntry
         {
-            var offsetSec = Math.Max(0.0, (_clock.UtcNow - _activeManifest.StartedAtUtc).TotalSeconds);
-            var entry = new MarkerEntry
-            {
-                AtUtc = _clock.UtcNow,
-                OffsetSec = Math.Round(offsetSec, 2),
-                Note = note ?? string.Empty,
-                Kind = kind
-            };
-            _activeManifest.Markers.Add(entry);
-            if (_manifestSavedInitial)
-            {
-                var mirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-                _sessionStore?.Save(_activeManifest, mirrors);
-            }
+            AtUtc = _clock.UtcNow,
+            OffsetSec = Math.Round(_sessionClock.Elapsed.TotalSeconds, 2),
+            Note = note ?? string.Empty,
+            Kind = kind
+        };
+
+        lock (manifest)
+        {
+            manifest.Markers.Add(entry);
+        }
+
+        Log.Information("Marker added: {Kind} - {Note} at {Elapsed}s", kind, note, entry.OffsetSec);
+        if (_manifestSavedInitial)
+        {
+            SaveManifest(manifest);
         }
     }
 
@@ -221,17 +240,7 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
 
         if (_activeManifest != null)
         {
-            _activeManifest.Events.Add(new SessionEventEntry
-            {
-                AtUtc = _clock.UtcNow,
-                Type = muted ? "MicMuted" : "MicUnmuted",
-                Detail = label
-            });
-            if (_manifestSavedInitial)
-            {
-                var mirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-                _sessionStore?.Save(_activeManifest, mirrors);
-            }
+            AddSessionEvent(muted ? "MicMuted" : "MicUnmuted", label);
             _markerService?.AddMarker(label, "System");
         }
     }
@@ -239,40 +248,44 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
     private void OnAudioDeviceSwitched(object? sender, AudioDeviceSwitchedEventArgs e)
     {
         Log.Information("Controller: Audio device switched - {Detail}", e.Detail);
-        if (_activeManifest != null)
-        {
-            _activeManifest.Events.Add(new SessionEventEntry
-            {
-                AtUtc = _clock.UtcNow,
-                Type = "AudioDeviceSwitched",
-                Detail = e.Detail
-            });
-            if (_manifestSavedInitial)
-            {
-                var mirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-                _sessionStore?.Save(_activeManifest, mirrors);
-            }
-            _markerService?.AddEvent("AudioDeviceSwitched", e.Detail);
-        }
+        AddSessionEvent("AudioDeviceSwitched", e.Detail);
         AudioDeviceSwitchedNotification?.Invoke(this, e.Detail);
+    }
+
+    private void OnStorageSwitchRequested(object? sender, StorageSwitchRequestedEventArgs args)
+    {
+        Log.Information("StorageManager requested switch to {Location}. Reason: {Reason}", args.NewLocation, args.Reason);
+        if (args.RequiresRotation)
+        {
+            _segmentSink.RequestRotation(RotationReason.StorageSwitch);
+        }
+
+        AddSessionEvent("StorageSwitched", $"Switched to {args.NewLocation} ({args.Reason})");
     }
 
     private void TriggerReconcile()
     {
-        if (_lock.CurrentCount == 0) return;
+        if (_disposed || _lock.CurrentCount == 0) return;
 
-        Task.Run(async () =>
+        _ = Task.Run(async () =>
         {
-            if (await _lock.WaitAsync(0).ConfigureAwait(false))
+            try
             {
-                try
+                if (await _lock.WaitAsync(0).ConfigureAwait(false))
                 {
-                    await ReconcileLockedAsync().ConfigureAwait(false);
+                    try
+                    {
+                        await ReconcileLockedAsync().ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        _lock.Release();
+                    }
                 }
-                finally
-                {
-                    _lock.Release();
-                }
+            }
+            catch (ObjectDisposedException)
+            {
+                // Shutting down.
             }
         });
     }
@@ -281,14 +294,26 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
     {
         try
         {
-            // 1. Reconcile state based on desired state
             switch (_desired, _state)
             {
+                // Not running but should be. Transitional states only remain after an error.
                 case (DesiredState.Recording, RecorderState.Idle):
                 case (DesiredState.Recording, RecorderState.Faulted):
+                case (DesiredState.Recording, RecorderState.Recovering):
+                case (DesiredState.Recording, RecorderState.Stopping):
+                case (DesiredState.Recording, RecorderState.Saving):
+                case (DesiredState.Recording, RecorderState.Suspended):
                     if (_backoff.IsBackoffElapsed())
                     {
-                        await StartPipelineAsync().ConfigureAwait(false);
+                        // Continue the same session (new part) if it already recorded something.
+                        if (HasSessionData)
+                        {
+                            await ResumePipelineAsync().ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await StartPipelineAsync().ConfigureAwait(false);
+                        }
                     }
                     break;
 
@@ -301,171 +326,31 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
 
                 case (DesiredState.Recording, RecorderState.Recording):
                 case (DesiredState.Recording, RecorderState.Starting):
-                    // Check if FFmpeg exited unexpectedly
-                    if (!_ffmpegHost.IsRunning)
-                    {
-                        Log.Warning("Reconcile: FFmpeg stopped while DesiredState is Recording (State={State}). Restarting pipeline.", _state);
-                        await RestartPipelineAsync("FfmpegExited").ConfigureAwait(false);
-                        break;
-                    }
-
-                    // Check for hang (no stdout for > 5 seconds while running)
-                    var silentSec = (_clock.UtcNow - _ffmpegHost.LastStdoutActivityUtc).TotalSeconds;
-                    if (silentSec > 5.0 && _ffmpegHost.StdoutBytesTotal > 0)
-                    {
-                        Log.Warning("Reconcile: FFmpeg hang detected (no stdout bytes for {Sec:F1}s). Killing and restarting.", silentSec);
-                        _ffmpegHost.Kill();
-                        await RestartPipelineAsync("FfmpegHung").ConfigureAwait(false);
-                        break;
-                    }
-
-                    // Check for pending debounced display change (2s debounce)
-                    if (_displayChangePending && (DateTime.UtcNow - _displayChangeRequestedUtc).TotalSeconds >= 2.0)
-                    {
-                        _displayChangePending = false;
-                        Log.Information("Reconcile: Applying debounced display change.");
-                        await RestartPipelineAsync("DisplayChanged").ConfigureAwait(false);
-                        break;
-                    }
-
-                    // Memory & Speed Watchdogs when recording
-                    if (_state == RecorderState.Recording)
-                    {
-                        var wsBytes = _ffmpegHost.WorkingSet64;
-                        var wsMb = wsBytes / (1024.0 * 1024.0);
-                        _memoryHighWarning = wsMb > 400.0;
-
-                        if (wsMb > 600.0)
-                        {
-                            Log.Warning("Watchdog: FFmpeg memory {WsMb:F1} MB exceeded 600 MB threshold. Triggering restart.", wsMb);
-                            _activeManifest?.Events.Add(new SessionEventEntry
-                            {
-                                AtUtc = _clock.UtcNow,
-                                Type = "FfmpegMemoryRestart",
-                                Detail = $"Working set reached {wsMb:F1} MB"
-                            });
-
-                            _memoryRestarts.Add(_clock.UtcNow);
-                            _memoryRestarts.RemoveAll(t => (_clock.UtcNow - t).TotalMinutes > 30.0);
-                            if (_memoryRestarts.Count >= 3)
-                            {
-                                DegradeFps("3 memory restarts within 30 minutes");
-                            }
-
-                            await RestartPipelineAsync("FfmpegMemory").ConfigureAwait(false);
-                            break;
-                        }
-
-                        var speed = _ffmpegHost.LastProgress.Speed;
-                        if (speed > 0 && speed < 0.95)
-                        {
-                            _consecutiveLowSpeedSeconds++;
-                            if (_consecutiveLowSpeedSeconds >= 20)
-                            {
-                                _consecutiveLowSpeedSeconds = 0;
-                                DegradeFps($"Encoding speed < 0.95 ({speed:F2}x) for 20 seconds");
-                                await RestartPipelineAsync("EncoderTooSlow").ConfigureAwait(false);
-                                break;
-                            }
-                        }
-                        else if (speed >= 0.95)
-                        {
-                            _consecutiveLowSpeedSeconds = 0;
-                        }
-
-                        if ((_clock.UtcNow - _lastWatchdogLogUtc).TotalSeconds >= 60.0)
-                        {
-                            _lastWatchdogLogUtc = _clock.UtcNow;
-                            Log.Information("Recording watchdog: WorkingSet={WsMb:F1} MB, Speed={Speed:F2}x, Fps={Fps:F1}",
-                                wsMb, speed, _ffmpegHost.LastProgress.Fps);
-                        }
-
-                        // AUD-01: Zero audio sources watchdog (>10s -> Degraded & toast)
-                        var audioStatusCheck = _audioEngine.GetStatus();
-                        if (audioStatusCheck.ActiveDevices.Count == 0)
-                        {
-                            _zeroAudioSourcesSeconds++;
-                            if (_zeroAudioSourcesSeconds >= 10 && !_noAudioToastShown)
-                            {
-                                _noAudioToastShown = true;
-                                Log.Warning("Watchdog: Recording has zero audio sources for {Sec}s.", _zeroAudioSourcesSeconds);
-                                NoAudioSourcesNotification?.Invoke(this, EventArgs.Empty);
-                            }
-                        }
-                        else
-                        {
-                            _zeroAudioSourcesSeconds = 0;
-                            _noAudioToastShown = false;
-                        }
-
-                        // REC-01: Disk write growth watchdog (no growth for 10s -> Faulted, critical toast, RestartPipeline)
-                        var currentBytes = _segmentSink.BytesWritten;
-                        if (currentBytes > _lastBytesWritten)
-                        {
-                            _lastBytesWritten = currentBytes;
-                            _bytesWrittenStallSeconds = 0;
-
-                            if (!_manifestSavedInitial && _activeManifest != null && currentBytes > 0)
-                            {
-                                _manifestSavedInitial = true;
-                                var mirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-                                _sessionStore?.Save(_activeManifest, mirrors);
-                                Log.Information("Initial session manifest saved after first bytes received on disk for {SessionId}", _activeManifest.SessionId);
-                            }
-                        }
-                        else
-                        {
-                            _bytesWrittenStallSeconds++;
-                            if (_bytesWrittenStallSeconds >= 10)
-                            {
-                                _bytesWrittenStallSeconds = 0;
-                                Log.Error("Watchdog: No disk write growth for 10 seconds while recording (BytesWritten={Bytes}). Entering Faulted state.", currentBytes);
-                                SetState(RecorderState.Faulted);
-                                DiskWriteStallNotification?.Invoke(this, EventArgs.Empty);
-                                await RestartPipelineAsync("NoDiskWriteGrowth").ConfigureAwait(false);
-                                break;
-                            }
-                        }
-
-                        // REC-01: 30-second background comparison of on-disk length vs BytesWritten (±2 MB)
-                        if ((_clock.UtcNow - _lastDiskSizeCheckUtc).TotalSeconds >= 30.0)
-                        {
-                            _lastDiskSizeCheckUtc = _clock.UtcNow;
-                            var currentTsPath = _segmentSink.Current?.TsPath;
-                            if (!string.IsNullOrEmpty(currentTsPath))
-                            {
-                                _ = Task.Run(() =>
-                                {
-                                    try
-                                    {
-                                        if (File.Exists(currentTsPath))
-                                        {
-                                            var diskLen = new FileInfo(currentTsPath).Length;
-                                            if (Math.Abs(diskLen - currentBytes) > 2 * 1024 * 1024)
-                                            {
-                                                Log.Warning("Watchdog: On-disk length ({DiskLen:N0} bytes) deviates from BytesWritten ({BytesWritten:N0} bytes) by >2 MB for {Path}",
-                                                    diskLen, currentBytes, currentTsPath);
-                                                _diskLengthMismatchWarning = true;
-                                            }
-                                            else
-                                            {
-                                                _diskLengthMismatchWarning = false;
-                                            }
-                                        }
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        Log.Warning(ex, "Watchdog: Error checking file info for {Path}", currentTsPath);
-                                    }
-                                });
-                            }
-                        }
-                    }
+                    await SuperviseRunningPipelineAsync().ConfigureAwait(false);
                     break;
 
                 case (DesiredState.Paused, RecorderState.Recording):
                 case (DesiredState.Paused, RecorderState.Starting):
+                case (DesiredState.Paused, RecorderState.Faulted):
+                case (DesiredState.Paused, RecorderState.Recovering):
+                case (DesiredState.Paused, RecorderState.Stopping):
+                case (DesiredState.Paused, RecorderState.Saving):
+                case (DesiredState.Paused, RecorderState.Suspended):
                     await PausePipelineAsync().ConfigureAwait(false);
+                    break;
+
+                case (DesiredState.Paused, RecorderState.Idle):
+                    if (HasSessionData)
+                    {
+                        SetState(RecorderState.Paused);
+                        _lastPauseReminderUtc = _clock.UtcNow;
+                    }
+                    else
+                    {
+                        // Nothing was recorded yet (e.g. the start failed): there is nothing to pause.
+                        DiscardSession();
+                        _desired = DesiredState.Stopped;
+                    }
                     break;
 
                 case (DesiredState.Paused, RecorderState.Paused):
@@ -485,7 +370,7 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
             }
 
             // If starting, transition to recording once first stdout bytes arrive
-            if (_state == RecorderState.Starting && _ffmpegHost.StdoutBytesTotal > 0)
+            if (_state == RecorderState.Starting && _ffmpegHost.IsRunning && _ffmpegHost.StdoutBytesTotal > 0)
             {
                 SetState(RecorderState.Recording);
                 _sessionClock.StartSpan();
@@ -493,28 +378,218 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
             }
 
             // FILE-02: Create manifest once the first segment has bytes on disk
-            if (!_manifestSavedInitial && _segmentSink.BytesWritten > 0 && _activeManifest != null)
+            var manifest = _activeManifest;
+            if (!_manifestSavedInitial && manifest != null && _segmentSink.BytesWritten > 0)
             {
                 _manifestSavedInitial = true;
-                var mirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-                _sessionStore?.Save(_activeManifest, mirrors);
-                Log.Information("Initial session manifest saved to disk for session {SessionId}", _activeManifest.SessionId);
+                SaveManifest(manifest);
+                Log.Information("Initial session manifest saved to disk for session {SessionId}", manifest.SessionId);
             }
-
-            HealthChanged?.Invoke(this, BuildHealthSnapshot());
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Error in RecordingController ReconcileLockedAsync.");
             _backoff.RecordFailure();
-            if (_backoff.ConsecutiveFailures >= 3)
+
+            // Never stay in a transitional state after an error, or the state machine stops acting.
+            if (_state is RecorderState.Starting or RecorderState.Stopping or RecorderState.Saving or RecorderState.Recovering)
+            {
+                SetState(_desired == DesiredState.Paused ? RecorderState.Paused : RecorderState.Faulted);
+            }
+            else if (_backoff.ConsecutiveFailures >= 3 && _desired == DesiredState.Recording)
             {
                 SetState(RecorderState.Faulted);
             }
         }
+
+        try
+        {
+            HealthChanged?.Invoke(this, BuildHealthSnapshot());
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "A HealthChanged handler failed.");
+        }
     }
 
-    private void DegradeFps(string reason)
+    private async Task SuperviseRunningPipelineAsync()
+    {
+        var now = _clock.UtcNow;
+
+        // Check if FFmpeg exited unexpectedly
+        if (!_ffmpegHost.IsRunning)
+        {
+            Log.Warning("Reconcile: FFmpeg stopped while DesiredState is Recording (State={State}). Restarting pipeline.", _state);
+            await RestartPipelineAsync("FfmpegExited", countsAsFailure: true).ConfigureAwait(false);
+            return;
+        }
+
+        var hasOutput = _ffmpegHost.StdoutBytesTotal > 0;
+        if (hasOutput)
+        {
+            // Check for hang (no stdout while running)
+            var silentSec = (now - _ffmpegHost.LastStdoutActivityUtc).TotalSeconds;
+            if (silentSec > HangTimeout.TotalSeconds)
+            {
+                Log.Warning("Reconcile: FFmpeg hang detected (no stdout bytes for {Sec:F1}s). Killing and restarting.", silentSec);
+                _ffmpegHost.Kill();
+                await RestartPipelineAsync("FfmpegHung", countsAsFailure: true).ConfigureAwait(false);
+                return;
+            }
+        }
+        else if (now - _pipelineStartedUtc > StartTimeout)
+        {
+            Log.Warning("Reconcile: FFmpeg produced no output within {Sec:F0}s of starting. Killing and restarting.", StartTimeout.TotalSeconds);
+            _ffmpegHost.Kill();
+            await RestartPipelineAsync("FfmpegStartTimeout", countsAsFailure: true).ConfigureAwait(false);
+            return;
+        }
+
+        // Check for pending debounced display change (2s debounce)
+        if (_displayChangePending && (DateTime.UtcNow - _displayChangeRequestedUtc).TotalSeconds >= 2.0)
+        {
+            _displayChangePending = false;
+            Log.Information("Reconcile: Applying debounced display change.");
+            await RestartPipelineAsync("DisplayChanged", countsAsFailure: false).ConfigureAwait(false);
+            return;
+        }
+
+        if (_state == RecorderState.Recording)
+        {
+            await RunRecordingWatchdogsAsync(now).ConfigureAwait(false);
+        }
+    }
+
+    private async Task RunRecordingWatchdogsAsync(DateTime now)
+    {
+        var settings = _settingsService.Current;
+        var advanced = settings.Advanced;
+        var warnMb = advanced.FfmpegMemoryWarnMb > 0 ? advanced.FfmpegMemoryWarnMb : 400;
+        var restartMb = advanced.FfmpegMemoryRestartMb > warnMb ? advanced.FfmpegMemoryRestartMb : Math.Max(600, warnMb + 100);
+        var speedThreshold = advanced.SpeedDegradeThreshold is > 0 and < 1 ? advanced.SpeedDegradeThreshold : 0.95;
+        var speedSeconds = advanced.SpeedDegradeSeconds > 0 ? advanced.SpeedDegradeSeconds : 20;
+
+        // Memory
+        var wsMb = _ffmpegHost.WorkingSet64 / (1024.0 * 1024.0);
+        _memoryHighWarning = wsMb > warnMb;
+        if (wsMb > restartMb)
+        {
+            Log.Warning("Watchdog: FFmpeg memory {WsMb:F1} MB exceeded {Limit} MB threshold. Triggering restart.", wsMb, restartMb);
+            AddSessionEvent("FfmpegMemoryRestart", $"Working set reached {wsMb:F1} MB");
+
+            _memoryRestarts.Add(now);
+            _memoryRestarts.RemoveAll(t => (now - t).TotalMinutes > 30.0);
+            if (_memoryRestarts.Count >= 3)
+            {
+                DegradeFps("3 memory restarts within 30 minutes");
+            }
+
+            await RestartPipelineAsync("FfmpegMemory", countsAsFailure: false).ConfigureAwait(false);
+            return;
+        }
+
+        // Encoder speed
+        var speed = _ffmpegHost.LastProgress.Speed;
+        if (speed > 0 && speed < speedThreshold)
+        {
+            _lowSpeedSinceUtc ??= now;
+            if (now - _lowSpeedSinceUtc.Value >= TimeSpan.FromSeconds(speedSeconds))
+            {
+                _lowSpeedSinceUtc = null;
+
+                // Restarting only helps if the frame rate could actually be lowered.
+                if (DegradeFps($"Encoding speed < {speedThreshold:F2} ({speed:F2}x) for {speedSeconds} seconds"))
+                {
+                    await RestartPipelineAsync("EncoderTooSlow", countsAsFailure: false).ConfigureAwait(false);
+                    return;
+                }
+            }
+        }
+        else if (speed >= speedThreshold)
+        {
+            _lowSpeedSinceUtc = null;
+        }
+
+        if ((now - _lastWatchdogLogUtc).TotalSeconds >= 60.0)
+        {
+            _lastWatchdogLogUtc = now;
+            Log.Information("Recording watchdog: WorkingSet={WsMb:F1} MB, Speed={Speed:F2}x, Fps={Fps:F1}",
+                wsMb, speed, _ffmpegHost.LastProgress.Fps);
+        }
+
+        // AUD-01: Zero audio sources watchdog (>10s -> Degraded & toast). Expected when both are turned off.
+        var expectsAudio = settings.Audio.MicMode != MicMode.None || settings.Audio.OutputMode != OutputMode.None;
+        if (expectsAudio && _audioEngine.GetStatus().ActiveDevices.Count == 0)
+        {
+            _noAudioSinceUtc ??= now;
+            if (now - _noAudioSinceUtc.Value >= NoAudioTimeout && !_noAudioToastShown)
+            {
+                _noAudioToastShown = true;
+                Log.Warning("Watchdog: Recording has had no audio source for {Sec:F0}s.", (now - _noAudioSinceUtc.Value).TotalSeconds);
+                NoAudioSourcesNotification?.Invoke(this, EventArgs.Empty);
+            }
+        }
+        else
+        {
+            _noAudioSinceUtc = null;
+            _noAudioToastShown = false;
+        }
+
+        // REC-01: Disk write growth watchdog (no growth for 10s -> Faulted, critical toast, RestartPipeline)
+        var currentBytes = _segmentSink.BytesWritten;
+        if (currentBytes != _lastBytesWritten)
+        {
+            // Any change counts: a new part starts again from a few bytes.
+            _lastBytesWritten = currentBytes;
+            _lastBytesGrowthUtc = now;
+        }
+        else if (now - _lastBytesGrowthUtc >= DiskStallTimeout)
+        {
+            Log.Error("Watchdog: No disk write growth for {Sec:F0} seconds while recording (BytesWritten={Bytes}). Entering Faulted state.",
+                (now - _lastBytesGrowthUtc).TotalSeconds, currentBytes);
+            SetState(RecorderState.Faulted);
+            DiskWriteStallNotification?.Invoke(this, EventArgs.Empty);
+            await RestartPipelineAsync("NoDiskWriteGrowth", countsAsFailure: true).ConfigureAwait(false);
+            return;
+        }
+
+        // REC-01: 30-second background comparison of on-disk length vs BytesWritten (±2 MB)
+        if ((now - _lastDiskSizeCheckUtc).TotalSeconds >= 30.0)
+        {
+            _lastDiskSizeCheckUtc = now;
+            var currentTsPath = _segmentSink.Current?.TsPath;
+            if (!string.IsNullOrEmpty(currentTsPath))
+            {
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        if (File.Exists(currentTsPath))
+                        {
+                            var diskLen = new FileInfo(currentTsPath).Length;
+                            if (Math.Abs(diskLen - currentBytes) > 2 * 1024 * 1024)
+                            {
+                                Log.Warning("Watchdog: On-disk length ({DiskLen:N0} bytes) deviates from BytesWritten ({BytesWritten:N0} bytes) by >2 MB for {Path}",
+                                    diskLen, currentBytes, currentTsPath);
+                                _diskLengthMismatchWarning = true;
+                            }
+                            else
+                            {
+                                _diskLengthMismatchWarning = false;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning(ex, "Watchdog: Error checking file info for {Path}", currentTsPath);
+                    }
+                });
+            }
+        }
+    }
+
+    /// <summary>Lowers the frame rate one step. Returns false when it is already at the minimum.</summary>
+    private bool DegradeFps(string reason)
     {
         var current = _settingsService.Current.Video.FrameRate;
         var newFps = current switch
@@ -525,85 +600,120 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
             _ => 5
         };
 
-        if (newFps < current)
+        if (newFps >= current)
         {
-            Log.Warning("Degrading frame rate from {Old} to {New} fps. Reason: {Reason}", current, newFps, reason);
+            Log.Warning("Cannot lower the frame rate below {Fps} fps. Reason for trying: {Reason}", current, reason);
+            return false;
+        }
+
+        Log.Warning("Degrading frame rate from {Old} to {New} fps. Reason: {Reason}", current, newFps, reason);
+        try
+        {
             var updatedSettings = _settingsService.Current.Clone();
             updatedSettings.Video.FrameRate = newFps;
             _settingsService.Save(updatedSettings);
-
-            _activeManifest?.Events.Add(new SessionEventEntry
-            {
-                AtUtc = _clock.UtcNow,
-                Type = "FpsDegraded",
-                Detail = $"Frame rate lowered from {current} to {newFps} fps: {reason}"
-            });
-
-            FpsDegradedNotification?.Invoke(this, newFps);
         }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Could not save the lowered frame rate.");
+            return false;
+        }
+
+        AddSessionEvent("FpsDegraded", $"Frame rate lowered from {current} to {newFps} fps: {reason}");
+        FpsDegradedNotification?.Invoke(this, newFps);
+        return true;
     }
 
     private void OnSegmentClosed(object? sender, SegmentInfo seg)
     {
-        if (_activeManifest != null)
+        var manifest = _activeManifest;
+        if (manifest == null)
         {
+            return;
+        }
+
+        try
+        {
+            var storage = _settingsService.Current.Storage;
+            var format = storage.OutputFormat;
             var expLocation = Path.GetFullPath(Environment.ExpandEnvironmentVariables(seg.Location));
             var expTs = Path.GetFullPath(Environment.ExpandEnvironmentVariables(seg.TsPath));
-            var expFinal = Path.GetFullPath(Environment.ExpandEnvironmentVariables(seg.FinalPath));
 
-            var relTs = Path.GetRelativePath(expLocation, expTs);
-            var relFinal = Path.GetRelativePath(expLocation, expFinal);
+            // The final file's extension must match the container the post-processor writes.
+            var expFinal = format switch
+            {
+                OutputContainerFormat.Ts => expTs,
+                OutputContainerFormat.Mp4 => Path.ChangeExtension(expTs, ".mp4"),
+                _ => Path.ChangeExtension(expTs, ".mkv")
+            };
 
+            var endedUtc = seg.EndedAtUtc ?? _clock.UtcNow;
             var entry = new SegmentManifestEntry
             {
                 Index = seg.Index,
                 Location = expLocation,
-                TsPath = relTs,
-                FinalPath = relFinal,
+                TsPath = Path.GetRelativePath(expLocation, expTs),
+                FinalPath = Path.GetRelativePath(expLocation, expFinal),
                 StartedAtUtc = seg.StartedAtUtc,
-                EndedAtUtc = seg.EndedAtUtc,
+                EndedAtUtc = endedUtc,
                 Bytes = seg.Bytes,
                 OpenReason = seg.OpenReason.ToString(),
                 CloseReason = seg.CloseReason?.ToString(),
-                Remux = "Pending"
+                Remux = "Pending",
+                // Approximation until the post-processor measures the real length.
+                DurationSec = Math.Round(Math.Max(0.0, (endedUtc - seg.StartedAtUtc).TotalSeconds), 2)
             };
-            _activeManifest.Segments.Add(entry);
+
+            List<MarkerEntry> markers;
+            lock (manifest)
+            {
+                manifest.Segments.Add(entry);
+                markers = manifest.Markers.ToList();
+            }
 
             _manifestSavedInitial = true;
-            var mirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-            _sessionStore?.Save(_activeManifest, mirrors);
+            SaveManifest(manifest);
 
-            if (_postProcessor != null)
+            // A split inside a running recording starts a new part timer.
+            if (seg.CloseReason is not null and not RotationReason.Manual && _sessionClock.IsRunning)
             {
-                var job = new RemuxJob
-                {
-                    TsPath = seg.TsPath,
-                    FinalPath = seg.FinalPath,
-                    OutputFormat = _settingsService.Current.Storage.OutputFormat,
-                    KeepTsAfterRemux = _settingsService.Current.Storage.KeepTsAfterRemux,
-                    SessionTitle = $"ScreenVault {_activeManifest.SessionId} part {seg.Index}",
-                    Markers = _activeManifest.Markers.ToList(),
-                    SegmentStartUtc = seg.StartedAtUtc,
-                    SegmentEndUtc = seg.EndedAtUtc ?? _clock.UtcNow,
-                    SessionId = _activeManifest.SessionId,
-                    SegmentIndex = seg.Index
-                };
-                _postProcessor.Enqueue(job);
+                _sessionClock.StartPartSpan();
             }
-        }
 
-        _lastBytesWritten = 0;
-        _bytesWrittenStallSeconds = 0;
+            _postProcessor?.Enqueue(new RemuxJob
+            {
+                TsPath = expTs,
+                FinalPath = expFinal,
+                OutputFormat = format,
+                KeepTsAfterRemux = storage.KeepTsAfterRemux,
+                SessionTitle = $"ScreenVault {manifest.SessionId} part {seg.Index}",
+                Markers = markers,
+                SegmentStartUtc = seg.StartedAtUtc,
+                SegmentEndUtc = endedUtc,
+                SessionId = manifest.SessionId,
+                SegmentIndex = seg.Index
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Failed to record the closed segment {Path} in the session", seg.TsPath);
+        }
     }
 
     private async Task StartPipelineAsync()
     {
         Log.Information("Starting recording pipeline for new session...");
+
+        // A previous attempt that never recorded anything is simply dropped.
+        DiscardSession();
+
         SetState(RecorderState.Starting);
         _sessionStartTimeUtc = _clock.UtcNow;
-        _sessionStartLocal = _clock.UtcNow.ToLocalTime();
+        _sessionStartLocal = _sessionStartTimeUtc.ToLocalTime();
         _sessionClock.Reset();
         _currentPartIndex = 1;
+        _encoderFailures = 0;
+        _memoryRestarts.Clear();
 
         try
         {
@@ -615,11 +725,12 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
             var profile = EncoderProfile.Create(_activeProfileName, settings.Video.Quality, settings.Video.FrameRate);
 
             var sessionId = SegmentNaming.FormatSessionId(_sessionStartLocal);
-            _activeManifest = new SessionManifest
+            var manifest = new SessionManifest
             {
                 SessionId = sessionId,
                 Status = "Recording",
                 StartedAtUtc = _sessionStartTimeUtc,
+                AppVersion = typeof(RecordingController).Assembly.GetName().Version?.ToString(3) ?? "1.2.0",
                 Video = new SessionVideoMeta
                 {
                     EncoderProfile = _activeProfileName,
@@ -640,35 +751,28 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
                 ? StorageDirectoryHelper.GetMetadataDirectory(new System.IO.Abstractions.FileSystem(), activeLoc)
                 : null;
 
-            _markerService?.SetActiveSession(_activeManifest, _activeMetadataBackupDir);
+            _activeManifest = manifest;
             _manifestSavedInitial = false;
+            _sessionStore?.RegisterLive(manifest, MetadataMirrors());
+            _markerService?.SetActiveSession(manifest, _activeMetadataBackupDir, () => _sessionClock.Elapsed.TotalSeconds);
 
             var spec = FfmpegCommandBuilder.Build(paths.FfmpegPath, settings, profile, includeAudio: true);
 
-            _segmentSink.BeginStream(_sessionStartLocal, _currentPartIndex);
             if (settings.Audio.UnmuteOnNewSession)
             {
                 _audioEngine.SetMicMute(false);
             }
-            _audioEngine.EnsureCaptureRunning();
-            _lastBytesWritten = 0;
-            _bytesWrittenStallSeconds = 0;
-            _zeroAudioSourcesSeconds = 0;
-            _noAudioToastShown = false;
-            _diskLengthMismatchWarning = false;
 
-            await _ffmpegHost.StartAsync(spec, _segmentSink, CancellationToken.None).ConfigureAwait(false);
-            _audioEngine.AttachOutput(_ffmpegHost.AudioInput);
-
+            await LaunchPipelineAsync(spec, settings).ConfigureAwait(false);
             Log.Information("Pipeline started successfully. Awaiting first bytes.");
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to start recording pipeline.");
+            await TearDownPipelineAsync().ConfigureAwait(false);
             _backoff.RecordFailure();
             _encoderFailures++;
-            SetState(_backoff.ConsecutiveFailures >= 3 ? RecorderState.Faulted : RecorderState.Idle);
-            throw;
+            SetState(RecorderState.Faulted);
         }
     }
 
@@ -686,42 +790,75 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
             _activeProfileName = ResolveProfileName(settings);
             var profile = EncoderProfile.Create(_activeProfileName, settings.Video.Quality, settings.Video.FrameRate);
 
-            _currentPartIndex = Math.Max(_currentPartIndex + 1, (_activeManifest?.Segments.Count ?? 0) + 1);
-
-            if (_activeManifest != null)
-            {
-                _activeManifest.Events.Add(new SessionEventEntry
-                {
-                    AtUtc = _clock.UtcNow,
-                    Type = "Resumed",
-                    Detail = $"Resumed at part {_currentPartIndex}, elapsed offset: {_sessionClock.Elapsed:hh\\:mm\\:ss}"
-                });
-                var mirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-                _sessionStore?.Save(_activeManifest, mirrors);
-            }
+            _currentPartIndex = NextPartIndex();
+            AddSessionEvent("Resumed", $"Resumed at part {_currentPartIndex}, elapsed offset: {_sessionClock.Elapsed:hh\\:mm\\:ss}", saveAlways: true);
 
             var spec = FfmpegCommandBuilder.Build(paths.FfmpegPath, settings, profile, includeAudio: true);
-
-            _segmentSink.BeginStream(_sessionStartLocal, _currentPartIndex);
-            _audioEngine.EnsureCaptureRunning();
-            _lastBytesWritten = 0;
-            _bytesWrittenStallSeconds = 0;
-            _zeroAudioSourcesSeconds = 0;
-            _noAudioToastShown = false;
-            _diskLengthMismatchWarning = false;
-
-            await _ffmpegHost.StartAsync(spec, _segmentSink, CancellationToken.None).ConfigureAwait(false);
-            _audioEngine.AttachOutput(_ffmpegHost.AudioInput);
+            await LaunchPipelineAsync(spec, settings).ConfigureAwait(false);
 
             Log.Information("Pipeline resumed successfully. Awaiting first bytes for part {Part}.", _currentPartIndex);
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to resume recording pipeline.");
+            await TearDownPipelineAsync().ConfigureAwait(false);
             _backoff.RecordFailure();
             _encoderFailures++;
-            SetState(_backoff.ConsecutiveFailures >= 3 ? RecorderState.Faulted : RecorderState.Paused);
-            throw;
+            SetState(_desired == DesiredState.Paused ? RecorderState.Paused : RecorderState.Faulted);
+        }
+    }
+
+    private async Task LaunchPipelineAsync(FfmpegLaunchSpec spec, AppSettings settings)
+    {
+        var storage = settings.Storage;
+        _segmentSink.ConfigureSplitting(
+            storage.SplitMinutes > 0 ? TimeSpan.FromMinutes(storage.SplitMinutes) : null,
+            storage.SplitSizeMb > 0 ? storage.SplitSizeMb * 1024L * 1024L : null);
+
+        _segmentSink.BeginStream(_sessionStartLocal, _currentPartIndex);
+        _audioEngine.EnsureCaptureRunning();
+
+        var now = _clock.UtcNow;
+        _pipelineStartedUtc = now;
+        _lastBytesWritten = 0;
+        _lastBytesGrowthUtc = now;
+        _lowSpeedSinceUtc = null;
+        _noAudioSinceUtc = null;
+        _noAudioToastShown = false;
+        _diskLengthMismatchWarning = false;
+
+        await _ffmpegHost.StartAsync(spec, _segmentSink, CancellationToken.None).ConfigureAwait(false);
+        _audioEngine.AttachOutput(_ffmpegHost.AudioInput);
+    }
+
+    /// <summary>Stops FFmpeg, the audio feed and the current part. Never throws.</summary>
+    private async Task TearDownPipelineAsync()
+    {
+        try
+        {
+            _audioEngine.DetachOutput();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Error detaching audio output.");
+        }
+
+        try
+        {
+            await _ffmpegHost.StopAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Error stopping FFmpeg.");
+        }
+
+        try
+        {
+            _segmentSink.EndStream();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Error closing the current part.");
         }
     }
 
@@ -731,68 +868,50 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
         SetState(RecorderState.Stopping);
         _sessionClock.StopSpan();
 
-        _audioEngine.DetachOutput();
-        await _ffmpegHost.StopAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
-        _segmentSink.EndStream();
+        await TearDownPipelineAsync().ConfigureAwait(false);
 
         SetState(RecorderState.Paused);
         _lastPauseReminderUtc = _clock.UtcNow;
-
-        if (_activeManifest != null)
-        {
-            _activeManifest.Events.Add(new SessionEventEntry
-            {
-                AtUtc = _clock.UtcNow,
-                Type = "Paused",
-                Detail = $"Paused at elapsed offset: {_sessionClock.Elapsed:hh\\:mm\\:ss}"
-            });
-            var mirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-            _sessionStore?.Save(_activeManifest, mirrors);
-        }
+        AddSessionEvent("Paused", $"Paused at elapsed offset: {_sessionClock.Elapsed:hh\\:mm\\:ss}", saveAlways: true);
 
         Log.Information("Recording pipeline paused cleanly.");
     }
 
-    private async Task RestartPipelineAsync(string reason)
+    private async Task RestartPipelineAsync(string reason, bool countsAsFailure)
     {
         Log.Information("Restarting pipeline. Reason: {Reason}", reason);
         SetState(RecorderState.Recovering);
         _sessionClock.StopSpan();
 
-        _audioEngine.DetachOutput();
-        await _ffmpegHost.StopAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
-        _segmentSink.EndStream();
+        await TearDownPipelineAsync().ConfigureAwait(false);
+        AddSessionEvent("PipelineRestarted", reason);
 
-        _backoff.RecordFailure();
-        _encoderFailures++;
-
-        if (_encoderFailures >= 3 && _activeProfileName != "x264")
+        if (countsAsFailure)
         {
-            Log.Warning("Repeated encoder failures detected ({Count}). Falling back to libx264 profile.", _encoderFailures);
-            _activeProfileName = "x264";
-        }
+            _backoff.RecordFailure();
+            _encoderFailures++;
 
-        if (_backoff.ConsecutiveFailures >= 3)
-        {
-            Log.Warning("Repeated pipeline failures ({Count}). Entering Faulted state for backoff.", _backoff.ConsecutiveFailures);
-            SetState(RecorderState.Faulted);
-            return;
-        }
-
-        try
-        {
-            if (_activeManifest != null)
+            if (_encoderFailures >= 3 && _activeProfileName != "x264")
             {
-                await ResumePipelineAsync().ConfigureAwait(false);
+                Log.Warning("Repeated encoder failures detected ({Count}). Falling back to libx264 profile.", _encoderFailures);
+                _activeProfileName = "x264";
             }
-            else
+
+            if (_backoff.ConsecutiveFailures >= 3)
             {
-                await StartPipelineAsync().ConfigureAwait(false);
+                Log.Warning("Repeated pipeline failures ({Count}). Entering Faulted state for backoff.", _backoff.ConsecutiveFailures);
+                SetState(RecorderState.Faulted);
+                return;
             }
         }
-        catch (Exception ex)
+
+        if (HasSessionData)
         {
-            Log.Error(ex, "Failed to restart pipeline.");
+            await ResumePipelineAsync().ConfigureAwait(false);
+        }
+        else
+        {
+            await StartPipelineAsync().ConfigureAwait(false);
         }
     }
 
@@ -802,48 +921,179 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
         SetState(RecorderState.Saving);
         _sessionClock.StopSpan();
 
-        _audioEngine.DetachOutput();
-        await _ffmpegHost.StopAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
-        _segmentSink.EndStream();
+        await TearDownPipelineAsync().ConfigureAwait(false);
 
-        if (_activeManifest != null)
+        var manifest = _activeManifest;
+        if (manifest == null)
         {
-            var totalBytes = _activeManifest.Segments.Sum(s => s.Bytes);
-            if (totalBytes == 0 && _segmentSink.BytesWritten == 0)
+            Log.Information("Recording pipeline stopped (no active session).");
+            return;
+        }
+
+        long recordedBytes;
+        int partCount;
+        lock (manifest)
+        {
+            recordedBytes = manifest.Segments.Sum(s => s.Bytes);
+            partCount = manifest.Segments.Count;
+        }
+
+        if (recordedBytes == 0 && _segmentSink.BytesWritten == 0)
+        {
+            Log.Warning("Session {SessionId} ended with 0 bytes (failed start). Deleting manifest if any.", manifest.SessionId);
+            try
             {
-                Log.Warning("Session {SessionId} ended with 0 bytes (failed start). Deleting manifest if any.", _activeManifest.SessionId);
-                var mirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-                _sessionStore?.Delete(_activeManifest.SessionId, mirrors);
-                _markerService?.ClearActiveSession();
-                _activeManifest = null;
-                _activeMetadataBackupDir = null;
-                _manifestSavedInitial = false;
-                SetState(RecorderState.Idle);
-                return;
+                _sessionStore?.Delete(manifest.SessionId, MetadataMirrors());
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not delete the empty session {SessionId}", manifest.SessionId);
             }
 
-            _activeManifest.Status = "Completed";
-            _activeManifest.EndedAtUtc = _clock.UtcNow;
-            _activeManifest.Events.Add(new SessionEventEntry
+            ReleaseSession();
+            return;
+        }
+
+        lock (manifest)
+        {
+            manifest.Status = "Completed";
+            manifest.EndedAtUtc = _clock.UtcNow;
+            manifest.Events.Add(new SessionEventEntry
             {
                 AtUtc = _clock.UtcNow,
                 Type = "SavedByUser",
-                Detail = $"Recording stopped and saved with {_activeManifest.Segments.Count} part(s)"
+                Detail = $"Recording stopped and saved with {partCount} part(s)"
             });
+        }
 
-            var stopMirrors = !string.IsNullOrEmpty(_activeMetadataBackupDir) ? new[] { _activeMetadataBackupDir } : null;
-            _sessionStore?.Save(_activeManifest, stopMirrors);
-            _markerService?.ClearActiveSession();
+        SaveManifest(manifest);
+        ReleaseSession();
 
-            var completedSession = _activeManifest;
-            _activeManifest = null;
-            _activeMetadataBackupDir = null;
-            _manifestSavedInitial = false;
-
-            SessionCompleted?.Invoke(this, completedSession);
+        try
+        {
+            SessionCompleted?.Invoke(this, manifest);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "A SessionCompleted handler failed.");
         }
 
         Log.Information("Recording pipeline stopped and saved.");
+    }
+
+    /// <summary>True once the active session has something on disk worth continuing.</summary>
+    private bool HasSessionData
+    {
+        get
+        {
+            var manifest = _activeManifest;
+            if (manifest == null)
+            {
+                return false;
+            }
+
+            if (_manifestSavedInitial)
+            {
+                return true;
+            }
+
+            lock (manifest)
+            {
+                return manifest.Segments.Count > 0;
+            }
+        }
+    }
+
+    private int NextPartIndex()
+    {
+        var manifest = _activeManifest;
+        var highest = 0;
+        if (manifest != null)
+        {
+            lock (manifest)
+            {
+                highest = manifest.Segments.Count > 0 ? manifest.Segments.Max(s => s.Index) : 0;
+            }
+        }
+
+        return Math.Max(_currentPartIndex + 1, highest + 1);
+    }
+
+    private void AddSessionEvent(string type, string detail, bool saveAlways = false)
+    {
+        var manifest = _activeManifest;
+        if (manifest == null)
+        {
+            return;
+        }
+
+        lock (manifest)
+        {
+            manifest.Events.Add(new SessionEventEntry
+            {
+                AtUtc = _clock.UtcNow,
+                Type = type,
+                Detail = detail
+            });
+        }
+
+        if (_manifestSavedInitial || (saveAlways && HasSessionData))
+        {
+            SaveManifest(manifest);
+        }
+    }
+
+    private void SaveManifest(SessionManifest manifest)
+    {
+        try
+        {
+            _sessionStore?.Save(manifest, MetadataMirrors());
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Could not save session manifest {SessionId}", manifest.SessionId);
+        }
+    }
+
+    private string[]? MetadataMirrors() =>
+        !string.IsNullOrEmpty(_activeMetadataBackupDir) ? [_activeMetadataBackupDir] : null;
+
+    /// <summary>Drops an active session that never recorded anything.</summary>
+    private void DiscardSession()
+    {
+        var manifest = _activeManifest;
+        if (manifest == null)
+        {
+            return;
+        }
+
+        if (_manifestSavedInitial)
+        {
+            try
+            {
+                _sessionStore?.Delete(manifest.SessionId, MetadataMirrors());
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Could not delete the abandoned session {SessionId}", manifest.SessionId);
+            }
+        }
+
+        ReleaseSession();
+    }
+
+    private void ReleaseSession()
+    {
+        var manifest = _activeManifest;
+        if (manifest != null)
+        {
+            _sessionStore?.UnregisterLive(manifest.SessionId);
+        }
+
+        _markerService?.ClearActiveSession();
+        _activeManifest = null;
+        _activeMetadataBackupDir = null;
+        _manifestSavedInitial = false;
     }
 
     private string ResolveProfileName(AppSettings settings)
@@ -887,9 +1137,9 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
         var audioStatus = _audioEngine.GetStatus();
         var warnings = new List<string>(audioStatus.DegradedFlags);
 
-        if (_backoff.ConsecutiveFailures > 0)
+        if (_backoff.ConsecutiveFailures > 0 && _desired != DesiredState.Stopped)
         {
-            warnings.Add($"Pipeline failure backoff active (Failures: {_backoff.ConsecutiveFailures})");
+            warnings.Add($"Recording had to restart {_backoff.ConsecutiveFailures} time(s) in a row");
         }
 
         if (_memoryHighWarning)
@@ -898,7 +1148,7 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
             warnings.Add($"FFmpeg memory high ({wsMb:F0} MB)");
         }
 
-        if (_zeroAudioSourcesSeconds >= 10)
+        if (_noAudioSinceUtc is { } noAudioSince && _clock.UtcNow - noAudioSince >= NoAudioTimeout)
         {
             warnings.Add("Recording has no audio source — check your devices");
         }
@@ -910,12 +1160,17 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
 
         var isDegraded = warnings.Count > 0;
 
+        // Only report a file while a session is active; after stopping, the last part's raw file
+        // may already have been converted and removed.
+        var hasSession = _activeManifest != null;
+        var current = hasSession ? _segmentSink.Current : null;
+
         return new HealthSnapshot(
             _state,
             _desired,
             isDegraded,
             elapsed,
-            _segmentSink.Current?.TsPath,
+            current?.TsPath,
             _segmentSink.BytesWritten,
             audioStatus.ActiveDevices,
             warnings,
@@ -923,14 +1178,25 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
             _ffmpegHost.LastProgress.Fps,
             _ffmpegHost.LastProgress.Speed,
             partElapsed,
-            _currentPartIndex,
+            current?.Index ?? _currentPartIndex,
             _ffmpegHost.WorkingSet64);
     }
 
     public async ValueTask DisposeAsync()
     {
+        if (_disposed)
+        {
+            return;
+        }
+
         await _reconcileTimer.DisposeAsync().ConfigureAwait(false);
         await StopAsync(CancellationToken.None).ConfigureAwait(false);
+        _disposed = true;
+        if (_storageManager != null)
+        {
+            _storageManager.SwitchRequested -= OnStorageSwitchRequested;
+        }
+
         _lock.Dispose();
     }
 }

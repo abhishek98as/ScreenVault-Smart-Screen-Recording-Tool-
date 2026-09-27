@@ -9,7 +9,7 @@
     4. Bundles FFmpeg tools, licenses, and notices.
     5. Cleans any transient files (settings.json, install-defaults.json, logs).
     6. Optionally signs binaries.
-    7. Compiles the installer using Inno Setup 6 (ISCC.exe).
+    7. Compiles the installer using Inno Setup 6.7+ or 7.x (ISCC.exe).
     8. Generates SHA-256 checksums.
 .PARAMETER Version
     The version number to build (e.g. 1.2.0). If omitted, read from Directory.Build.props.
@@ -50,8 +50,12 @@ if (-not $Version) {
 Write-Host "=== ScreenVault Build & Package v$Version ===" -ForegroundColor Cyan
 
 # 2. Locate Inno Setup Compiler (ISCC.exe)
+# The installer uses the modern light/dark wizard, which needs Inno Setup 6.7+ (7.x recommended).
 $isccCandidates = @(
     (Get-Command "ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+    "${env:ProgramFiles}\Inno Setup 7\ISCC.exe",
+    "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
+    "$env:LOCALAPPDATA\Programs\Inno Setup 7\ISCC.exe",
     "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
     "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
@@ -59,7 +63,7 @@ $isccCandidates = @(
 
 $isccPath = $isccCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 if (-not $isccPath) {
-    throw "Inno Setup compiler (ISCC.exe) was not found in PATH or standard installation directories. Please install Inno Setup 6.3+."
+    throw "Inno Setup compiler (ISCC.exe) was not found in PATH or standard installation directories. Please install Inno Setup 6.7 or newer (7.x recommended) from https://jrsoftware.org/isdl.php"
 }
 Write-Host "Found Inno Setup Compiler: $isccPath" -ForegroundColor Gray
 

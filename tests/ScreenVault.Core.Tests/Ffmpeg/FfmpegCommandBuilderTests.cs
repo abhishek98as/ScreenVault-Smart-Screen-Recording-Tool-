@@ -63,6 +63,7 @@ public sealed class FfmpegCommandBuilderTests
 
         var spec = FfmpegCommandBuilder.Build(@"C:\tools\ffmpeg\ffmpeg.exe", settings, profile, includeAudio: false);
 
-        spec.Arguments.Any(a => a.Contains("scale=1920:-2")).ShouldBeTrue();
+        // Caps the width at 1920 px (never upscales smaller screens) and keeps the aspect ratio.
+        spec.Arguments.Any(a => a.Contains("scale=w='trunc(min(1920,iw)/2)*2':h=-2", StringComparison.Ordinal)).ShouldBeTrue();
     }
 }

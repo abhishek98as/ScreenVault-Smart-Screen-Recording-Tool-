@@ -32,4 +32,12 @@ public interface ISegmentSink
     SegmentInfo? Current { get; }
     long BytesWritten { get; }
     event EventHandler<SegmentInfo>? SegmentClosed;
+
+    /// <summary>
+    /// Starts a new part automatically once the current one is <paramref name="maxDuration"/> long
+    /// or <paramref name="maxBytes"/> big (at the next keyframe). Null disables that limit.
+    /// </summary>
+    void ConfigureSplitting(TimeSpan? maxDuration, long? maxBytes)
+    {
+    }
 }

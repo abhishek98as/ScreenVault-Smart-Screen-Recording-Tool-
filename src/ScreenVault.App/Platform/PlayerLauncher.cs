@@ -42,13 +42,13 @@ public sealed class PlayerLauncher
 
         if (chosen == PlaybackPlayer.Vlc)
         {
-            var vlc = FindVlcPath();
+            var vlc = SafeFindVlcPath();
             if (vlc != null) return new ResolvedPlayer(ResolvedPlayerType.Vlc, vlc);
         }
 
         if (chosen == PlaybackPlayer.Ffplay)
         {
-            var ffplay = FindFfplayPath(settings);
+            var ffplay = SafeFindFfplayPath(settings);
             if (ffplay != null) return new ResolvedPlayer(ResolvedPlayerType.Ffplay, ffplay);
         }
 
@@ -59,14 +59,14 @@ public sealed class PlayerLauncher
 
         // Auto resolution order:
         // 1. VLC
-        var autoVlc = FindVlcPath();
+        var autoVlc = SafeFindVlcPath();
         if (autoVlc != null)
         {
             return new ResolvedPlayer(ResolvedPlayerType.Vlc, autoVlc);
         }
 
         // 2. Bundled ffplay.exe
-        var autoFfplay = FindFfplayPath(settings);
+        var autoFfplay = SafeFindFfplayPath(settings);
         if (autoFfplay != null)
         {
             return new ResolvedPlayer(ResolvedPlayerType.Ffplay, autoFfplay);
@@ -86,7 +86,7 @@ public sealed class PlayerLauncher
         if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
         {
             Log.Warning("PlayerLauncher: file does not exist: {Path}", filePath);
-            MessageBox.Show($"File does not exist:\n{filePath}", "Cannot Play File", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            UI.ModernDialog.Warning(null, "Can't play this file", $"The file no longer exists:\n{filePath}");
             return false;
         }
 
@@ -96,7 +96,7 @@ public sealed class PlayerLauncher
             var msg = "No video player found. Install VLC (free) or choose a player in Settings → Advanced.\n\n" +
                       "(Note: .ts recording parts are not opened with system default to avoid opening code editors).";
             Log.Warning("PlayerLauncher: {Msg}", msg);
-            MessageBox.Show(msg, "No Video Player Available", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            UI.ModernDialog.Warning(null, "No video player available", msg);
             return false;
         }
 
@@ -159,8 +159,35 @@ public sealed class PlayerLauncher
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to launch video player for {Path}", filePath);
-            MessageBox.Show($"Failed to launch player:\n{ex.Message}", "Playback Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            UI.ModernDialog.Error(null, "Couldn't start the video player", ex.Message);
             return false;
+        }
+    }
+
+    private static string? SafeFindVlcPath()
+    {
+        try
+        {
+            return FindVlcPath();
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Could not look up VLC.");
+            return null;
+        }
+    }
+
+    private static string? SafeFindFfplayPath(AppSettings settings)
+    {
+        try
+        {
+            return FindFfplayPath(settings);
+        }
+        catch (Exception ex)
+        {
+            // FfmpegLocator throws when FFmpeg is missing; that only means ffplay isn't available.
+            Log.Debug(ex, "Could not look up ffplay.");
+            return null;
         }
     }
 

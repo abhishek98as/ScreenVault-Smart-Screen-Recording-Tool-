@@ -39,7 +39,15 @@ public sealed class RetentionService : IRetentionService
 
     private void OnTimerTick(object? state)
     {
-        _ = RunCleanupAsync();
+        // Timer callbacks must never throw: an exception here would take the whole app down.
+        try
+        {
+            _ = RunCleanupAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Retention: clean-up run failed.");
+        }
     }
 
     public Task<int> RunCleanupAsync(CancellationToken ct = default)
@@ -86,36 +94,34 @@ public sealed class RetentionService : IRetentionService
             Log.Information("Retention: Cleaning up expired session {SessionId} (Recorded {Started})",
                 manifest.SessionId, manifest.StartedAtUtc);
 
-            // Delete segment files
+            // Delete segment files and the merged file, remembering the folders they were in
+            var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var seg in manifest.Segments)
             {
-                DeleteFileIfExists(seg.FinalPath, seg.Location);
-                DeleteFileIfExists(seg.TsPath, seg.Location);
+                AddFolder(folders, DeleteFileIfExists(seg.FinalPath, seg.Location));
+                AddFolder(folders, DeleteFileIfExists(seg.TsPath, seg.Location));
             }
 
-            // Delete day folder markers.txt / session manifest if all segments deleted
-            if (manifest.Segments.Count > 0)
+            if (!string.IsNullOrWhiteSpace(manifest.MergedPath))
             {
-                var loc = manifest.Segments[0].Location;
-                var day = manifest.StartedAtUtc.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
-                var dayFolder = _fileSystem.Path.Combine(loc, day);
+                AddFolder(folders, DeleteFileIfExists(Environment.ExpandEnvironmentVariables(manifest.MergedPath), string.Empty));
+            }
 
-                if (_fileSystem.Directory.Exists(dayFolder))
+            // Remove day folders that are now completely empty. Never delete recursively: the user
+            // may keep their own files (exported clips, notes) next to the recordings.
+            foreach (var folder in folders)
+            {
+                try
                 {
-                    try
+                    if (_fileSystem.Directory.Exists(folder) && !_fileSystem.Directory.EnumerateFileSystemEntries(folder).Any())
                     {
-                        var remainingFiles = _fileSystem.Directory.GetFiles(dayFolder, "SV_*.*");
-                        if (remainingFiles.Length == 0)
-                        {
-                            // Delete day folder
-                            _fileSystem.Directory.Delete(dayFolder, recursive: true);
-                            Log.Information("Retention: Removed empty day directory {Dir}", dayFolder);
-                        }
+                        _fileSystem.Directory.Delete(folder, recursive: false);
+                        Log.Information("Retention: Removed empty day directory {Dir}", folder);
                     }
-                    catch (Exception ex)
-                    {
-                        Log.Warning(ex, "Retention: Could not remove directory {Dir}", dayFolder);
-                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Retention: Could not remove directory {Dir}", folder);
                 }
             }
 
@@ -144,13 +150,16 @@ public sealed class RetentionService : IRetentionService
         return Task.FromResult(deletedCount);
     }
 
-    private void DeleteFileIfExists(string? relativeOrFullPath, string baseLocation)
+    /// <summary>Deletes the file if it exists and returns the folder it was in (or null).</summary>
+    private string? DeleteFileIfExists(string? relativeOrFullPath, string baseLocation)
     {
-        if (string.IsNullOrWhiteSpace(relativeOrFullPath)) return;
+        if (string.IsNullOrWhiteSpace(relativeOrFullPath)) return null;
+
+        if (!_fileSystem.Path.IsPathRooted(relativeOrFullPath) && string.IsNullOrWhiteSpace(baseLocation)) return null;
 
         var fullPath = _fileSystem.Path.IsPathRooted(relativeOrFullPath)
             ? relativeOrFullPath
-            : _fileSystem.Path.Combine(baseLocation, relativeOrFullPath);
+            : _fileSystem.Path.Combine(Environment.ExpandEnvironmentVariables(baseLocation), relativeOrFullPath);
 
         try
         {
@@ -160,10 +169,24 @@ public sealed class RetentionService : IRetentionService
                 _fileSystem.File.Delete(fullPath);
                 Log.Information("Retention: Deleted {Path} ({Bytes} bytes)", fullPath, size);
             }
+
+            // Already gone (deleted earlier, or the manifest points at a stale path) — the folder
+            // is still a candidate for the empty-directory cleanup below, so return it either way.
+            return _fileSystem.Path.GetDirectoryName(fullPath);
         }
         catch (Exception ex)
         {
             Log.Warning(ex, "Retention: Failed to delete file {Path}", fullPath);
+        }
+
+        return null;
+    }
+
+    private static void AddFolder(HashSet<string> folders, string? folder)
+    {
+        if (!string.IsNullOrEmpty(folder))
+        {
+            folders.Add(folder);
         }
     }
 

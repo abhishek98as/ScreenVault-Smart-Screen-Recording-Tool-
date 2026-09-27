@@ -32,6 +32,12 @@ public sealed class NotificationPresenter : INotificationPresenter
     private readonly ISettingsService _settingsService;
     private readonly Dictionary<string, DateTime> _lastShown = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _lock = new();
+    private volatile string? _lastShownKey;
+
+    /// <summary>Key of the most recent notification, so a click on it can do the right thing.</summary>
+    public string? LastShownKey => _lastShownKey;
+
+    public const string PausedReminderKey = "PausedReminder";
 
     public NotificationPresenter(NotifyIcon notifyIcon, ISettingsService settingsService)
     {
@@ -127,9 +133,9 @@ public sealed class NotificationPresenter : INotificationPresenter
 
     public void ShowPausedReminder()
     {
-        ShowRateLimited("PausedReminder", TimeSpan.FromMinutes(10),
+        ShowRateLimited(PausedReminderKey, TimeSpan.FromMinutes(10),
             "Recording Paused",
-            "Recording has been paused for 10 minutes. Click to resume.",
+            "Recording has been paused for 10 minutes. Click here to resume.",
             ToolTipIcon.Warning);
     }
 
@@ -144,8 +150,8 @@ public sealed class NotificationPresenter : INotificationPresenter
     public void ShowWelcome()
     {
         ShowRateLimited("Welcome", TimeSpan.FromMinutes(1),
-            "ScreenVault Active",
-            "ScreenVault is recording in the background. Look for the camera icon in your system tray (near the clock).",
+            "ScreenVault is running",
+            "Find it in the notification area near the clock. Click its icon to start recording or check the status.",
             ToolTipIcon.Info);
     }
 
@@ -202,6 +208,7 @@ public sealed class NotificationPresenter : INotificationPresenter
             }
 
             _lastShown[key] = now;
+            _lastShownKey = key;
         }
 
         try

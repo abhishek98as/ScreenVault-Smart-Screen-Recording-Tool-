@@ -35,8 +35,8 @@ internal static class Program
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) =>
         {
-            Log.Fatal(e.Exception, "Application.ThreadException encountered: {Message}", e.Exception.Message);
-            Logging.CloseAndFlush();
+            // The app keeps running after a UI error, so the logger must stay open.
+            Log.Error(e.Exception, "Unhandled UI exception: {Message}", e.Exception.Message);
         };
 
         TaskScheduler.UnobservedTaskException += (_, e) =>
@@ -98,14 +98,24 @@ internal static class Program
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            // 5. Register Windows Application Restart
-            ApplicationRestart.Register();
+            // 5. Register Windows Application Restart (updated while recording so a crash resumes it)
+            ApplicationRestart.Register(resumeRecording: false);
 
             // 6. Load settings
             var settingsService = new SettingsService(isPortable: cli.Portable);
             Log.Information("Settings loaded. Video FrameRate={Fps}, SplitMinutes={Split}",
                 settingsService.Current.Video.FrameRate,
                 settingsService.Current.Storage.SplitMinutes);
+
+            // "Log detail" from Settings, unless --log-level was given for this run.
+            if (string.IsNullOrEmpty(cli.LogLevel))
+            {
+                Logging.SetLevel(settingsService.Current.Advanced.LogLevel);
+                settingsService.SettingsChanged += (_, s) => Logging.SetLevel(s.Advanced.LogLevel);
+            }
+
+            // 7a. Light/dark palette for all windows (follows Windows unless overridden in Settings)
+            UI.Theming.Theme.Initialize(settingsService.Current.General.Theme);
 
             // 7. Run tray context
             Application.Run(new TrayApplicationContext(cli, settingsService));
@@ -114,6 +124,20 @@ internal static class Program
         catch (Exception ex)
         {
             Log.Fatal(ex, "ScreenVault encountered an unhandled fatal error.");
+            try
+            {
+                // Theme.Current defaults to the light palette even when the crash happened before
+                // Theme.Initialize ran, so ModernDialog is safe to use here too.
+                UI.ModernDialog.Error(
+                    null,
+                    "ScreenVault couldn't start",
+                    $"{ex.Message}\n\nDetails are in the log files in %LOCALAPPDATA%\\ScreenVault\\logs.");
+            }
+            catch
+            {
+                // Nothing more we can do.
+            }
+
             return 1;
         }
         finally
@@ -134,7 +158,7 @@ internal static class Program
         else if (cli.Toggle) cmd = "toggle";
         else if (cli.Pause) cmd = "pause";
         else if (cli.Resume) cmd = "resume";
-        else if (!string.IsNullOrEmpty(cli.MarkerNote))
+        else if (cli.AddMarker || !string.IsNullOrEmpty(cli.MarkerNote))
         {
             cmd = "marker";
             note = cli.MarkerNote;
@@ -143,7 +167,9 @@ internal static class Program
         else if (cli.Settings) cmd = "settings";
         else if (cli.Exit) cmd = "exit";
 
-        var response = await ControlPipeClient.SendCommandAsync(cmd, note).ConfigureAwait(false);
+        // Stopping waits for FFmpeg to finish writing the last part, which can take a few seconds.
+        var timeoutMs = cmd is "stop" or "toggle" or "pause" or "resume" or "start" ? 20000 : 5000;
+        var response = await ControlPipeClient.SendCommandAsync(cmd, note, timeoutMs).ConfigureAwait(false);
 
         if (cli.Status)
         {
