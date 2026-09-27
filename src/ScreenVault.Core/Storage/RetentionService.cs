@@ -168,8 +168,11 @@ public sealed class RetentionService : IRetentionService
                 var size = _fileSystem.FileInfo.New(fullPath).Length;
                 _fileSystem.File.Delete(fullPath);
                 Log.Information("Retention: Deleted {Path} ({Bytes} bytes)", fullPath, size);
-                return _fileSystem.Path.GetDirectoryName(fullPath);
             }
+
+            // Already gone (deleted earlier, or the manifest points at a stale path) — the folder
+            // is still a candidate for the empty-directory cleanup below, so return it either way.
+            return _fileSystem.Path.GetDirectoryName(fullPath);
         }
         catch (Exception ex)
         {

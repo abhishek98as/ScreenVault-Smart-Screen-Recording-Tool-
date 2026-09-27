@@ -60,17 +60,39 @@ public static class FfmpegRunner
                 {
                     process.Kill(entireProcessTree: true);
                 }
+
+                // Kill() only requests termination; wait for it to actually happen (with a
+                // non-cancellable token, since we've already decided to cancel) so the caller
+                // never races FFmpeg for the output file it was writing.
+                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
             {
                 Log.Debug(ex, "Could not stop FFmpeg after cancellation.");
             }
 
+            // The process exiting closes its redirected streams, which can fault a pending
+            // ReadToEndAsync. Observe that fault here instead of leaving it to surface later as an
+            // unobserved task exception, then propagate the real OperationCanceledException.
+            await ObserveAsync(stdoutTask).ConfigureAwait(false);
+            await ObserveAsync(stderrTask).ConfigureAwait(false);
             throw;
         }
 
         await stdoutTask.ConfigureAwait(false);
         var stderr = await stderrTask.ConfigureAwait(false);
         return (process.ExitCode, stderr);
+
+        static async Task ObserveAsync(Task task)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "Ignoring a stream-read fault after FFmpeg was cancelled and killed.");
+            }
+        }
     }
 }

@@ -126,11 +126,12 @@ internal static class Program
             Log.Fatal(ex, "ScreenVault encountered an unhandled fatal error.");
             try
             {
-                MessageBox.Show(
-                    $"ScreenVault could not start and has closed.\n\n{ex.Message}\n\nDetails are in the log files in %LOCALAPPDATA%\\ScreenVault\\logs.",
-                    "ScreenVault",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
+                // Theme.Current defaults to the light palette even when the crash happened before
+                // Theme.Initialize ran, so ModernDialog is safe to use here too.
+                UI.ModernDialog.Error(
+                    null,
+                    "ScreenVault couldn't start",
+                    $"{ex.Message}\n\nDetails are in the log files in %LOCALAPPDATA%\\ScreenVault\\logs.");
             }
             catch
             {
