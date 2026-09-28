@@ -107,7 +107,9 @@ public sealed class StatusForm : ModernForm
         ShowInTaskbar = true;
         StartPosition = FormStartPosition.Manual;
         ClientSize = new Size(400, 640);
-        TopMost = true;
+        // Deliberately not TopMost: an always-on-top flyout covered every window and dialog it
+        // opened (a dialog it owns is not lifted above it), which made the app look frozen.
+        // Popups and alerts are topmost themselves instead.
         KeyPreview = true;
 
         // ── Header: brand, pin, close ────────────────────────────────────────────────
@@ -350,6 +352,9 @@ public sealed class StatusForm : ModernForm
         PerformLayout();
     }
 
+    /// <summary>True while the user has pinned the flyout open.</summary>
+    public bool IsPinned => _isPinned;
+
     public void SetStartupComplete(bool complete = true)
     {
         _isStartupComplete = complete;
@@ -413,7 +418,6 @@ public sealed class StatusForm : ModernForm
     private void SetPinned(bool pinned)
     {
         _isPinned = pinned;
-        TopMost = pinned;
         _btnPin.Glyph = pinned ? Glyphs.Pinned : Glyphs.Pin;
         _btnPin.Kind = pinned ? ButtonKind.Secondary : ButtonKind.Subtle;
         _btnPin.AccessibleName = pinned ? "Unpin window" : "Keep window open";

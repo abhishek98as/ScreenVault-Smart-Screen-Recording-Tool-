@@ -33,7 +33,9 @@ public sealed class ModernDialog : ModernForm
         MaximizeBox = false;
         MinimizeBox = false;
         ShowInTaskbar = !hasOwner;
-        TopMost = !hasOwner;
+        // Always above every app, including the window that opened it: a modal dialog hidden
+        // behind its owner leaves that window disabled with no visible way out.
+        TopMost = true;
         StartPosition = hasOwner ? FormStartPosition.CenterParent : FormStartPosition.CenterScreen;
         ClientSize = new Size(460, 200);
         KeyPreview = true;
