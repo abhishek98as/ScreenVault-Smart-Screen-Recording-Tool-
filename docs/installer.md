@@ -145,7 +145,7 @@ Execute the unified build and package script:
 1. Detects version from `-Version` or `Directory.Build.props`.
 2. Executes `dotnet test ScreenVault.sln -c Release` (halts on any failure).
 3. Publishes self-contained ReadyToRun folder publish to `artifacts/publish/` (win-x64).
-4. Bundles bundled FFmpeg utilities (`ffmpeg.exe`, `ffprobe.exe`, `ffplay.exe`), notices, and licenses.
+4. Bundles the FFmpeg tools the app uses (`ffmpeg.exe`, `ffprobe.exe`), notices, and licenses. `ffplay.exe` is not shipped: recordings open in the user's own video app.
 5. Verifies absence of temporary configuration or log files.
 6. Invokes Inno Setup compiler (`ISCC.exe`) targeting `installer/ScreenVault.iss`.
 7. Calculates SHA-256 hash and writes `artifacts/installer/ScreenVault_Setup_<version>.exe.sha256.txt`.

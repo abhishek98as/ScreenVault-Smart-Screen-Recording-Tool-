@@ -23,7 +23,7 @@
     <Content Include="Resources\app.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <None Include="..\..\tools\ffmpeg\**\*">
+    <None Include="..\..\tools\ffmpeg\**\*" Exclude="..\..\tools\ffmpeg\**\ffplay.exe">
       <Link>ffmpeg\%(RecursiveDir)%(FileName)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

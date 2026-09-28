@@ -895,7 +895,7 @@ public sealed class StatusForm : ModernForm
         var path = _controller.Health.CurrentFilePath;
         if (!string.IsNullOrEmpty(path) && File.Exists(path))
         {
-            _playerLauncher.Launch(path);
+            _playerLauncher.Launch(path, owner: this);
         }
         else
         {
@@ -908,7 +908,7 @@ public sealed class StatusForm : ModernForm
         var latestFile = GetLastSavedFilePath(forceRefresh: true);
         if (!string.IsNullOrEmpty(latestFile) && File.Exists(latestFile))
         {
-            _playerLauncher.Launch(latestFile);
+            _playerLauncher.Launch(latestFile, owner: this);
             return;
         }
 
@@ -958,7 +958,7 @@ public sealed class StatusForm : ModernForm
 
         if (!string.IsNullOrEmpty(path) && File.Exists(path))
         {
-            PlayerLauncher.OpenWithDialog(path);
+            PlayerLauncher.OpenWithDialog(path, this);
         }
         else
         {

@@ -645,7 +645,7 @@ public sealed class LibraryForm : ModernForm
             return;
         }
 
-        _playerLauncher.Launch(file);
+        _playerLauncher.Launch(file, owner: this);
     }
 
     private void ShowSelectedInFolder()
@@ -680,7 +680,7 @@ public sealed class LibraryForm : ModernForm
             if (File.Exists(expMerged))
             {
                 var targetSeek = Math.Max(0.0, marker.OffsetSec - preRoll);
-                _playerLauncher.Launch(expMerged, targetSeek);
+                _playerLauncher.Launch(expMerged, targetSeek, this);
                 return;
             }
         }
@@ -701,7 +701,7 @@ public sealed class LibraryForm : ModernForm
                     var full = Path.IsPathRooted(segFile) ? segFile : Path.GetFullPath(Path.Combine(expLocation, segFile));
                     if (File.Exists(full))
                     {
-                        _playerLauncher.Launch(full, targetSeek);
+                        _playerLauncher.Launch(full, targetSeek, this);
                         return;
                     }
                 }
@@ -714,7 +714,7 @@ public sealed class LibraryForm : ModernForm
         var fallback = ResolvePrimaryPlaybackFile(_selectedSession);
         if (!string.IsNullOrEmpty(fallback))
         {
-            _playerLauncher.Launch(fallback, Math.Max(0.0, marker.OffsetSec - preRoll));
+            _playerLauncher.Launch(fallback, Math.Max(0.0, marker.OffsetSec - preRoll), this);
         }
     }
 

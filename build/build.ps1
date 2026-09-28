@@ -113,7 +113,9 @@ New-Item -ItemType Directory -Force -Path $publishFfmpegDir | Out-Null
 
 $ffmpegSrcDir = Join-Path $repoRoot "tools\ffmpeg"
 if (Test-Path $ffmpegSrcDir) {
-    Copy-Item "$ffmpegSrcDir\*" $publishFfmpegDir -Recurse -Force
+    # ffplay is not shipped: recordings open in the user's own video app.
+    Copy-Item "$ffmpegSrcDir\*" $publishFfmpegDir -Recurse -Force -Exclude "ffplay.exe"
+    Remove-Item (Join-Path $publishFfmpegDir "ffplay.exe") -Force -ErrorAction SilentlyContinue
 } else {
     Write-Warning "FFmpeg source directory not found at $ffmpegSrcDir."
 }
