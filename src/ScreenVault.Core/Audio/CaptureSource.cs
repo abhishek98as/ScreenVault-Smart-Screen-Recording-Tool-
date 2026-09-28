@@ -14,12 +14,20 @@ public sealed class CaptureSource : IDisposable
     private readonly LevelMeter _meter = new();
 
     private DateTime _lastDataReceivedUtc = DateTime.UtcNow;
+    private long _framesReceived;
+    private readonly int _blockAlign;
     private volatile bool _isDisposed;
     private volatile bool _isFaulted;
 
     public string DeviceId { get; }
     public string DeviceFriendlyName { get; }
     public DateTime CreatedUtc { get; } = DateTime.UtcNow;
+
+    /// <summary>Device frames delivered by Windows so far (diagnostics: 0 means nothing arrives).</summary>
+    public long FramesReceived => Interlocked.Read(ref _framesReceived);
+
+    /// <summary>e.g. "48000 Hz 2ch" — the device's own format, before conversion.</summary>
+    public string FormatDescription { get; }
 
     /// <summary>True once capture stopped on its own (device invalidated, driver reset…).</summary>
     public bool IsFaulted => _isFaulted;
@@ -49,7 +57,11 @@ public sealed class CaptureSource : IDisposable
             _capture = new WasapiCapture(device, useEventSync: true, audioBufferMillisecondsLength: 50);
         }
 
-        _pipeline = new FormatPipeline(_capture.WaveFormat);
+        var format = _capture.WaveFormat;
+        _blockAlign = format.BlockAlign;
+        FormatDescription = string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"{format.SampleRate} Hz {format.Channels}ch {format.Encoding}");
+        _pipeline = new FormatPipeline(format);
 
         _capture.DataAvailable += OnDataAvailable;
         _capture.RecordingStopped += OnRecordingStopped;
@@ -75,6 +87,11 @@ public sealed class CaptureSource : IDisposable
     private void OnDataAvailable(object? sender, WaveInEventArgs e)
     {
         _lastDataReceivedUtc = DateTime.UtcNow;
+        if (e.BytesRecorded > 0 && _blockAlign > 0)
+        {
+            Interlocked.Add(ref _framesReceived, e.BytesRecorded / _blockAlign);
+        }
+
         try
         {
             _pipeline.PushData(e.Buffer, 0, e.BytesRecorded, _jitterBuffer, _meter);

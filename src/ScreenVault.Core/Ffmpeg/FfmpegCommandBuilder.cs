@@ -52,8 +52,8 @@ public static class FfmpegCommandBuilder
             args.Add("48000");
             args.Add("-ac");
             args.Add("2");
-            args.Add("-thread_queue_size");
-            args.Add("1024");
+            // No -thread_queue_size here: newer FFmpeg builds only accept it as an output option
+            // and refuse to start with it on an input, and 9.x records this input cleanly without it.
             args.Add("-i");
             args.Add("pipe:0");
 

@@ -28,17 +28,13 @@ public sealed class FfmpegCommandBuilderTests
         spec.Arguments.ShouldContain("-pix_fmt");
         spec.Arguments.ShouldContain("yuv420p");
 
-        // Verify thread_queue_size is placed only immediately before audio pipe:0
+        // The raw audio input is fully described before "-i pipe:0" and carries no
+        // -thread_queue_size (newer FFmpeg rejects it on inputs and refuses to start).
         var argList = spec.Arguments.ToList();
-        var tqIndex = argList.IndexOf("-thread_queue_size");
-        tqIndex.ShouldBeGreaterThan(-1);
-        spec.Arguments[tqIndex + 1].ShouldBe("1024");
-        spec.Arguments[tqIndex + 2].ShouldBe("-i");
-        spec.Arguments[tqIndex + 3].ShouldBe("pipe:0");
-
-        // Ensure video input (lavfi) does not have thread_queue_size before it
-        var lavfiIndex = argList.IndexOf("lavfi");
-        spec.Arguments.Take(lavfiIndex).ShouldNotContain("-thread_queue_size");
+        var pipeIndex = argList.IndexOf("pipe:0");
+        argList[pipeIndex - 1].ShouldBe("-i");
+        argList.Skip(pipeIndex - 7).Take(6).ShouldBe(["-f", "f32le", "-ar", "48000", "-ac", "2"]);
+        spec.Arguments.ShouldNotContain("-thread_queue_size");
     }
 
     [Fact]
