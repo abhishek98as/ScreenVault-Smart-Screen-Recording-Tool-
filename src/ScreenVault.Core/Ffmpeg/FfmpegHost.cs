@@ -256,8 +256,30 @@ public sealed class FfmpegHost : IFfmpegHost
         }
     }
 
+    /// <summary>"frame=123", "out_time_ms=…", "progress=continue": one key=value per line.</summary>
+    private static bool IsProgressLine(string line)
+    {
+        var equals = line.IndexOf('=', StringComparison.Ordinal);
+        if (equals <= 0)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < equals; i++)
+        {
+            var c = line[i];
+            if (!(char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c == '_'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private async Task ReadStderrAsync(Process process, CancellationToken ct)
     {
+        var messagesLogged = 0;
         try
         {
             var reader = process.StandardError;
@@ -284,10 +306,15 @@ public sealed class FfmpegHost : IFfmpegHost
                     _lastStderrLines.Enqueue(line);
                 }
 
-                // If not progress key=value, log it
-                if (!line.Contains('='))
+                // Everything that isn't a "-progress" key=value line is a warning or an error (FFmpeg
+                // runs with -loglevel level+warning), e.g. about the audio input: keep it in the log.
+                if (line.Length > 0 && !IsProgressLine(line))
                 {
-                    Log.Debug("[FFmpeg stderr] {Line}", line);
+                    messagesLogged++;
+                    if (messagesLogged <= 50 || messagesLogged % 500 == 0)
+                    {
+                        Log.Warning("[FFmpeg] {Line} (message {Count})", line, messagesLogged);
+                    }
                 }
             }
         }

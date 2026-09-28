@@ -210,9 +210,9 @@ public sealed class SettingsForm : ModernForm
         _micDeviceRow = Row("Microphone device", "Only used while \"A specific microphone\" is selected above.", _cmbMicDevice, Glyphs.Microphone);
         _outputDeviceRow = Row("Output device", "Only used while \"A specific output device\" is selected above.", _cmbOutputDevice, Glyphs.Volume);
         audio.Controls.Add(Card(
-            Row("Microphone", "Follows the Windows default, so plugging in a headset just works.", _cmbMicMode, Glyphs.Microphone),
+            Row("Microphone", "Recommended: records the microphone your call is using (Teams, Zoom, a browser), otherwise the Windows default.", _cmbMicMode, Glyphs.Microphone),
             _micDeviceRow,
-            Row("System audio", "\"Default + communications\" also captures Teams or Zoom when they use a separate device.", _cmbOutputMode, Glyphs.Volume),
+            Row("System audio", "Recommended: records your default speakers plus any headset or device a call or app is playing to.", _cmbOutputMode, Glyphs.Volume),
             _outputDeviceRow));
         audio.Controls.Add(Section("Levels"));
         _trkMicGain.ValueChanged += (_, _) => _lblMicGainVal.Text = FormatGain(_trkMicGain.Value);

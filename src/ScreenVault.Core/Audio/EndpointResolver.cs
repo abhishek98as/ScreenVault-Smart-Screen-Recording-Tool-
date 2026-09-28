@@ -1,11 +1,12 @@
 using System.Runtime.InteropServices;
 using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
 using ScreenVault.Core.Settings;
 using Serilog;
 
 namespace ScreenVault.Core.Audio;
 
-public sealed record ResolvedEndpoint(string Id, string Name, bool IsLoopback, bool IsDegradedFallback = false);
+public sealed record ResolvedEndpoint(string Id, string Name, bool IsLoopback, bool IsDegradedFallback = false, string Reason = "Windows default");
 
 public sealed record EndpointResolutionResult(
     IReadOnlyList<ResolvedEndpoint> DesiredEndpoints,
@@ -15,35 +16,151 @@ public static class EndpointResolver
 {
     private const int E_NOTFOUND = unchecked((int)0x80070490);
 
-    public static EndpointResolutionResult Resolve(MMDeviceEnumerator enumerator, AudioSettings settings)
+    /// <param name="keepLoopbackIds">
+    /// Output devices already recorded in this session. In the recommended output mode they stay
+    /// recorded while they exist, so a call or a browser tab that goes quiet for a moment (and
+    /// closes its audio stream) doesn't lose the first seconds when it plays again.
+    /// </param>
+    public static EndpointResolutionResult Resolve(
+        MMDeviceEnumerator enumerator,
+        AudioSettings settings,
+        IReadOnlyCollection<string>? keepLoopbackIds = null)
     {
         var desired = new List<ResolvedEndpoint>();
         var warnings = new List<string>();
 
-        // 1. Resolve Microphone
+        // 1. Resolve Microphone(s)
         if (settings.MicMode != MicMode.None)
         {
-            var micResolved = ResolveMicrophone(enumerator, settings, warnings);
-            if (micResolved != null)
+            foreach (var mic in ResolveMicrophones(enumerator, settings, warnings))
             {
-                desired.Add(micResolved);
+                AddUnique(desired, mic);
             }
         }
 
         // 2. Resolve Outputs (Loopback)
         if (settings.OutputMode != OutputMode.None)
         {
-            var outputsResolved = ResolveOutputs(enumerator, settings, warnings);
-            foreach (var outEp in outputsResolved)
+            foreach (var outEp in ResolveOutputs(enumerator, settings, warnings, keepLoopbackIds))
             {
-                if (!desired.Any(d => d.Id.Equals(outEp.Id, StringComparison.OrdinalIgnoreCase)))
-                {
-                    desired.Add(outEp);
-                }
+                AddUnique(desired, outEp);
             }
         }
 
         return new EndpointResolutionResult(desired, warnings);
+    }
+
+    /// <summary>
+    /// In the recommended mode, record the microphone(s) another app (Teams, Zoom, a browser…) is
+    /// capturing from right now: that is what the call hears, and it is often not the Windows
+    /// default — a headset or webcam mic, or a docked laptop whose built-in mic is off with the
+    /// lid closed. With no call going on, record the Windows default microphone.
+    /// </summary>
+    private static List<ResolvedEndpoint> ResolveMicrophones(
+        MMDeviceEnumerator enumerator,
+        AudioSettings settings,
+        List<string> warnings)
+    {
+        if (settings.MicMode == MicMode.DefaultCommunications)
+        {
+            var inUse = FindEndpointsInUseByOtherApps(enumerator, DataFlow.Capture);
+            if (inUse.Count > 0)
+            {
+                return inUse;
+            }
+        }
+
+        var mic = ResolveMicrophone(enumerator, settings, warnings);
+        return mic == null ? [] : [mic];
+    }
+
+    /// <summary>
+    /// Active <paramref name="flow"/> devices on which another process is streaming right now
+    /// (our own capture streams and the Windows system-sounds session don't count).
+    /// </summary>
+    public static List<ResolvedEndpoint> FindEndpointsInUseByOtherApps(MMDeviceEnumerator enumerator, DataFlow flow)
+    {
+        ArgumentNullException.ThrowIfNull(enumerator);
+        var result = new List<ResolvedEndpoint>();
+        var ownProcessId = (uint)Environment.ProcessId;
+        var isLoopback = flow == DataFlow.Render;
+
+        try
+        {
+            foreach (var device in enumerator.EnumerateAudioEndPoints(flow, DeviceState.Active))
+            {
+                try
+                {
+                    if (HasActiveSessionFromOtherProcess(device, ownProcessId))
+                    {
+                        result.Add(new ResolvedEndpoint(device.ID, device.FriendlyName, isLoopback, Reason: "in use by another app"));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Debug(ex, "Could not read the audio sessions of a {Flow} device.", flow);
+                }
+                finally
+                {
+                    try
+                    {
+                        device.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Debug(ex, "Could not release a {Flow} device.", flow);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Debug(ex, "Could not list {Flow} devices to find the ones in use.", flow);
+        }
+
+        return result;
+    }
+
+    private static bool HasActiveSessionFromOtherProcess(MMDevice device, uint ownProcessId)
+    {
+        var sessions = device.AudioSessionManager.Sessions;
+        if (sessions == null)
+        {
+            return false;
+        }
+
+        var count = sessions.Count;
+        for (var i = 0; i < count; i++)
+        {
+            var session = sessions[i];
+            try
+            {
+                if (session.State != AudioSessionState.AudioSessionStateActive || session.IsSystemSoundsSession)
+                {
+                    continue;
+                }
+
+                var processId = session.GetProcessID;
+                if (processId != 0 && processId != ownProcessId)
+                {
+                    return true;
+                }
+            }
+            finally
+            {
+                session.Dispose();
+            }
+        }
+
+        return false;
+    }
+
+    private static void AddUnique(List<ResolvedEndpoint> list, ResolvedEndpoint endpoint)
+    {
+        if (!list.Any(e => e.Id.Equals(endpoint.Id, StringComparison.OrdinalIgnoreCase)))
+        {
+            list.Add(endpoint);
+        }
     }
 
     private static ResolvedEndpoint? ResolveMicrophone(
@@ -58,7 +175,7 @@ public static class EndpointResolver
                 using var device = enumerator.GetDevice(settings.MicDeviceId);
                 if (device is { State: DeviceState.Active })
                 {
-                    return new ResolvedEndpoint(device.ID, device.FriendlyName, false);
+                    return new ResolvedEndpoint(device.ID, device.FriendlyName, false, Reason: "chosen in Settings");
                 }
             }
             catch (Exception ex)
@@ -109,7 +226,8 @@ public static class EndpointResolver
     private static List<ResolvedEndpoint> ResolveOutputs(
         MMDeviceEnumerator enumerator,
         AudioSettings settings,
-        List<string> warnings)
+        List<string> warnings,
+        IReadOnlyCollection<string>? keepLoopbackIds)
     {
         var results = new List<ResolvedEndpoint>();
 
@@ -120,7 +238,7 @@ public static class EndpointResolver
                 using var device = enumerator.GetDevice(settings.OutputDeviceId);
                 if (device is { State: DeviceState.Active })
                 {
-                    results.Add(new ResolvedEndpoint(device.ID, device.FriendlyName, true));
+                    results.Add(new ResolvedEndpoint(device.ID, device.FriendlyName, true, Reason: "chosen in Settings"));
                     return results;
                 }
             }
@@ -141,7 +259,7 @@ public static class EndpointResolver
                 {
                     using (dev)
                     {
-                        results.Add(new ResolvedEndpoint(dev.ID, dev.FriendlyName, true));
+                        results.Add(new ResolvedEndpoint(dev.ID, dev.FriendlyName, true, Reason: "all playback devices"));
                     }
                 }
                 return results;
@@ -187,6 +305,42 @@ public static class EndpointResolver
             catch (Exception ex)
             {
                 Log.Debug(ex, "No separate communications audio output endpoint found.");
+            }
+        }
+
+        if (settings.OutputMode != OutputMode.DefaultPlusCommunications)
+        {
+            return results;
+        }
+
+        // Also record wherever apps are playing right now: a call on a headset, or on the laptop
+        // speakers while the Windows default is a monitor that has no speakers.
+        foreach (var inUse in FindEndpointsInUseByOtherApps(enumerator, DataFlow.Render))
+        {
+            AddUnique(results, inUse);
+        }
+
+        if (keepLoopbackIds != null)
+        {
+            foreach (var id in keepLoopbackIds)
+            {
+                if (results.Any(r => r.Id.Equals(id, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using var device = enumerator.GetDevice(id);
+                    if (device is { State: DeviceState.Active })
+                    {
+                        results.Add(new ResolvedEndpoint(device.ID, device.FriendlyName, true, Reason: "used earlier in this recording"));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Debug(ex, "Output device {Id} used earlier is gone.", id);
+                }
             }
         }
 

@@ -513,8 +513,8 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
         if ((now - _lastWatchdogLogUtc).TotalSeconds >= 60.0)
         {
             _lastWatchdogLogUtc = now;
-            Log.Information("Recording watchdog: WorkingSet={WsMb:F1} MB, Speed={Speed:F2}x, Fps={Fps:F1}",
-                wsMb, speed, _ffmpegHost.LastProgress.Fps);
+            Log.Information("Recording watchdog: WorkingSet={WsMb:F1} MB, Speed={Speed:F2}x, Fps={Fps:F1}. Audio: {Audio}",
+                wsMb, speed, _ffmpegHost.LastProgress.Fps, _audioEngine.DescribeForLog());
         }
 
         // AUD-01: Zero audio sources watchdog (>10s -> Degraded & toast). Expected when both are turned off.
@@ -820,6 +820,8 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
 
         var now = _clock.UtcNow;
         _pipelineStartedUtc = now;
+        // First watchdog line (with the audio summary) 15 s in, then every minute.
+        _lastWatchdogLogUtc = now.AddSeconds(-45);
         _lastBytesWritten = 0;
         _lastBytesGrowthUtc = now;
         _lowSpeedSinceUtc = null;

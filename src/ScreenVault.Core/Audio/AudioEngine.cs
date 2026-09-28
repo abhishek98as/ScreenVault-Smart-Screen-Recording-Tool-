@@ -43,6 +43,10 @@ public interface IAudioEngine : IDisposable
     bool IsMicMuted { get; }
     void ApplySettings(AudioSettings settings);
     AudioStatus GetStatus();
+
+    /// <summary>One-line summary of every source (level, data received) for the recording log.</summary>
+    string DescribeForLog() => string.Empty;
+
     string LastSwitchSummary { get; }
     event EventHandler<AudioDeviceSwitchedEventArgs>? DeviceSwitched;
 }
@@ -68,6 +72,9 @@ public sealed class AudioEngine : IAudioEngine
     private readonly System.Threading.Timer _safetyTimer;
 
     private readonly HashSet<object> _monitoringOwners = new(ReferenceEqualityComparer.Instance);
+
+    // Output devices recorded since capture started; see EndpointResolver.Resolve(keepLoopbackIds).
+    private readonly HashSet<string> _keptLoopbackIds = new(StringComparer.OrdinalIgnoreCase);
     private static readonly object DefaultMonitoringOwner = new();
 
     private DeviceWatcher? _watcher;
@@ -93,7 +100,8 @@ public sealed class AudioEngine : IAudioEngine
         _pump = new AudioPump(_stdinWriter);
 
         _debounceTimer = new System.Threading.Timer(OnDebounceElapsed, null, Timeout.Infinite, Timeout.Infinite);
-        _safetyTimer = new System.Threading.Timer(OnSafetyTimerElapsed, null, 5000, 5000);
+        // Also how quickly recording follows a call onto another microphone or headset.
+        _safetyTimer = new System.Threading.Timer(OnSafetyTimerElapsed, null, 2000, 2000);
     }
 
     public void Start(AudioSettings settings)
@@ -193,6 +201,7 @@ public sealed class AudioEngine : IAudioEngine
         _controlThread.Post(() =>
         {
             _settings = settings;
+            _keptLoopbackIds.Clear();
             Log.Information("Applying updated AudioSettings.");
             ApplyGroupGains();
             ReconcileInternal();
@@ -225,6 +234,16 @@ public sealed class AudioEngine : IAudioEngine
                 MicDisplayStatus: _micDisplayStatus,
                 SystemDisplayStatus: _systemDisplayStatus);
         }
+    }
+
+    public string DescribeForLog()
+    {
+        var sources = _sourcesSnapshot;
+        var parts = sources.Select(s => string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"{(s.IsLoopback ? "out" : "mic")} '{s.DeviceFriendlyName}' {s.FormatDescription} peak {s.Meter.PeakDb:F0} dB, {s.FramesReceived} frames in{(s.IsFaulted ? ", FAULTED" : string.Empty)}"));
+        var summary = sources.Length == 0 ? "no audio sources" : string.Join("; ", parts);
+        return string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"{summary}; muted={_isMicMuted}; pumped {_pump.TotalFramesPushed} frames, written {_stdinWriter.TotalFramesWritten}, dropped chunks {_stdinWriter.DroppedChunks}");
     }
 
     private void EnqueueDeviceEvent(DeviceEvent evt)
@@ -271,11 +290,12 @@ public sealed class AudioEngine : IAudioEngine
                     }
                     _activeSources.Clear();
                 }
+                _keptLoopbackIds.Clear();
                 UpdateDisplayStatuses(null);
                 return;
             }
 
-            var resolution = EndpointResolver.Resolve(_enumerator, _settings);
+            var resolution = EndpointResolver.Resolve(_enumerator, _settings, _keptLoopbackIds);
             var desiredIds = resolution.DesiredEndpoints.ToDictionary(e => e.Id, StringComparer.OrdinalIgnoreCase);
             var changed = false;
             var now = DateTime.UtcNow;
@@ -379,7 +399,7 @@ public sealed class AudioEngine : IAudioEngine
                             prior.NextRetryUtc = DateTime.MinValue;
                         }
                         changed = true;
-                        Log.Information("Added active audio source '{Name}' ({Id})", ep.Name, ep.Id);
+                        Log.Information("Added active audio source '{Name}' ({Id}) — {Reason}", ep.Name, ep.Id, ep.Reason);
                     }
                     catch (Exception ex)
                     {
@@ -411,6 +431,14 @@ public sealed class AudioEngine : IAudioEngine
             lock (_stateLock)
             {
                 _currentDegradedFlags = resolution.DegradedWarnings.ToList();
+            }
+
+            foreach (var source in _activeSources.Values)
+            {
+                if (source.IsLoopback)
+                {
+                    _keptLoopbackIds.Add(source.DeviceId);
+                }
             }
 
             // Update pump sources array atomically

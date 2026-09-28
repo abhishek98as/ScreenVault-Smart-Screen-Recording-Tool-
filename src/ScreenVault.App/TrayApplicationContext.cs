@@ -54,6 +54,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly System.Windows.Forms.Timer _trayTimer;
     private RecorderState _lastState = RecorderState.Idle;
     private bool _lastDegraded;
+    private bool _micPrivacyChecked;
     private bool? _restartRegisteredForRecording;
     private volatile bool _isShuttingDown;
     private volatile bool _suppressSavedDialogForCliStop;
@@ -391,6 +392,24 @@ public sealed class TrayApplicationContext : ApplicationContext
             _lastState = health.State;
             _lastDegraded = health.IsDegraded;
             UpdateTrayIcon(health.State, health.IsDegraded);
+        }
+
+        // Windows hands desktop apps pure silence when microphone access is off in Privacy
+        // settings: say so once per recording instead of saving hours without the user's voice.
+        if (health.Desired == DesiredState.Stopped)
+        {
+            _micPrivacyChecked = false;
+        }
+        else if (health.State == RecorderState.Recording && !_micPrivacyChecked)
+        {
+            _micPrivacyChecked = true;
+            if (_settingsService.Current.Audio.MicMode != MicMode.None && !MicPrivacyChecker.IsMicrophoneAccessAllowed())
+            {
+                Log.Warning("Windows privacy settings block desktop apps from the microphone; recordings will have no microphone audio.");
+                _notificationPresenter.ShowInfo(
+                    "Microphone blocked by Windows",
+                    "Your voice isn't being recorded. Turn on \"Let desktop apps access your microphone\" in Windows Settings → Privacy & security → Microphone.");
+            }
         }
 
         // If Windows restarts ScreenVault after a crash or an update, recording resumes only when it
