@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using NAudio.CoreAudioApi;
 using NAudio.CoreAudioApi.Interfaces;
@@ -15,6 +17,22 @@ public sealed record EndpointResolutionResult(
 public static class EndpointResolver
 {
     private const int E_NOTFOUND = unchecked((int)0x80070490);
+
+    /// <summary>
+    /// Processes whose microphone or speaker use means "a call" (Teams, Zoom, browsers for Meet or
+    /// web Teams, Slack, Discord, Webex…). Background audio tools that keep a device open all the
+    /// time (noise suppression, mixers) are deliberately absent: following them would record the
+    /// wrong or a doubled microphone. An app not listed simply falls back to the Windows default.
+    /// </summary>
+    private static readonly HashSet<string> CallApps = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ms-teams", "msteams", "teams", "msedgewebview2", "zoom", "slack", "discord", "discordptb", "discordcanary",
+        "skype", "webex", "webexmta", "atmgr", "ciscocollabhost", "ciscowebexstart", "g2mcomm", "gotomeeting", "goto",
+        "ringcentral", "whatsapp", "telegram", "signal", "viber", "chime", "lark", "feishu", "bluejeans", "element",
+        "chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "arc"
+    };
+
+    private static readonly ConcurrentDictionary<uint, (string Name, long ExpiresAt)> ProcessNames = new();
 
     /// <param name="keepLoopbackIds">
     /// Output devices already recorded in this session. In the recommended output mode they stay
@@ -51,7 +69,7 @@ public static class EndpointResolver
     }
 
     /// <summary>
-    /// In the recommended mode, record the microphone(s) another app (Teams, Zoom, a browser…) is
+    /// In the recommended mode, record the microphone(s) a call app (Teams, Zoom, a browser…) is
     /// capturing from right now: that is what the call hears, and it is often not the Windows
     /// default — a headset or webcam mic, or a docked laptop whose built-in mic is off with the
     /// lid closed. With no call going on, record the Windows default microphone.
@@ -63,7 +81,7 @@ public static class EndpointResolver
     {
         if (settings.MicMode == MicMode.DefaultCommunications)
         {
-            var inUse = FindEndpointsInUseByOtherApps(enumerator, DataFlow.Capture);
+            var inUse = FindEndpointsInUseByCallApps(enumerator, DataFlow.Capture);
             if (inUse.Count > 0)
             {
                 return inUse;
@@ -75,10 +93,10 @@ public static class EndpointResolver
     }
 
     /// <summary>
-    /// Active <paramref name="flow"/> devices on which another process is streaming right now
-    /// (our own capture streams and the Windows system-sounds session don't count).
+    /// Active <paramref name="flow"/> devices on which a call app (see <see cref="CallApps"/>) is
+    /// streaming right now.
     /// </summary>
-    public static List<ResolvedEndpoint> FindEndpointsInUseByOtherApps(MMDeviceEnumerator enumerator, DataFlow flow)
+    public static List<ResolvedEndpoint> FindEndpointsInUseByCallApps(MMDeviceEnumerator enumerator, DataFlow flow)
     {
         ArgumentNullException.ThrowIfNull(enumerator);
         var result = new List<ResolvedEndpoint>();
@@ -91,9 +109,10 @@ public static class EndpointResolver
             {
                 try
                 {
-                    if (HasActiveSessionFromOtherProcess(device, ownProcessId))
+                    var app = FindActiveCallApp(device, ownProcessId);
+                    if (app != null)
                     {
-                        result.Add(new ResolvedEndpoint(device.ID, device.FriendlyName, isLoopback, Reason: "in use by another app"));
+                        result.Add(new ResolvedEndpoint(device.ID, device.FriendlyName, isLoopback, Reason: $"in use by {app}"));
                     }
                 }
                 catch (Exception ex)
@@ -121,12 +140,13 @@ public static class EndpointResolver
         return result;
     }
 
-    private static bool HasActiveSessionFromOtherProcess(MMDevice device, uint ownProcessId)
+    /// <summary>Name of a call app with an active stream on <paramref name="device"/>, or null.</summary>
+    private static string? FindActiveCallApp(MMDevice device, uint ownProcessId)
     {
         var sessions = device.AudioSessionManager.Sessions;
         if (sessions == null)
         {
-            return false;
+            return null;
         }
 
         var count = sessions.Count;
@@ -141,9 +161,15 @@ public static class EndpointResolver
                 }
 
                 var processId = session.GetProcessID;
-                if (processId != 0 && processId != ownProcessId)
+                if (processId == 0 || processId == ownProcessId)
                 {
-                    return true;
+                    continue;
+                }
+
+                var name = ProcessName(processId);
+                if (name != null && CallApps.Contains(name))
+                {
+                    return name;
                 }
             }
             finally
@@ -152,7 +178,34 @@ public static class EndpointResolver
             }
         }
 
-        return false;
+        return null;
+    }
+
+    /// <summary>Process name for a session, cached for a minute (the lookup scans all processes).</summary>
+    private static string? ProcessName(uint processId)
+    {
+        var now = Environment.TickCount64;
+        if (ProcessNames.TryGetValue(processId, out var cached) && cached.ExpiresAt > now)
+        {
+            return cached.Name;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            var name = process.ProcessName;
+            if (ProcessNames.Count > 512)
+            {
+                ProcessNames.Clear();
+            }
+
+            ProcessNames[processId] = (name, now + 60_000);
+            return name;
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            return null; // Exited, or not visible to us.
+        }
     }
 
     private static void AddUnique(List<ResolvedEndpoint> list, ResolvedEndpoint endpoint)
@@ -313,9 +366,9 @@ public static class EndpointResolver
             return results;
         }
 
-        // Also record wherever apps are playing right now: a call on a headset, or on the laptop
-        // speakers while the Windows default is a monitor that has no speakers.
-        foreach (var inUse in FindEndpointsInUseByOtherApps(enumerator, DataFlow.Render))
+        // Also record wherever a call app is playing right now: a call on a headset, or on the
+        // laptop speakers while the Windows default is a monitor that has no speakers.
+        foreach (var inUse in FindEndpointsInUseByCallApps(enumerator, DataFlow.Render))
         {
             AddUnique(results, inUse);
         }
