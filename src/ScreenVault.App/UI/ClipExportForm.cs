@@ -140,7 +140,7 @@ public sealed class ClipExportForm : ModernForm
         _btnPlay = new ModernButton("Play", ButtonKind.Subtle, Glyphs.Play) { Bounds = new Rectangle(16, 18, 84, 32), Enabled = false };
         _btnPlay.Click += (_, _) =>
         {
-            if (!string.IsNullOrEmpty(_exportedFilePath)) _playerLauncher.Launch(_exportedFilePath);
+            if (!string.IsNullOrEmpty(_exportedFilePath)) _playerLauncher.Launch(_exportedFilePath, owner: this);
         };
         _btnShowInFolder = new ModernButton("Show in folder", ButtonKind.Subtle, Glyphs.FolderOpen) { Bounds = new Rectangle(104, 18, 140, 32), Enabled = false };
         _btnShowInFolder.Click += (_, _) =>

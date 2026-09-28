@@ -140,7 +140,7 @@ public sealed class SavedDialog : ModernForm
         _btnClose.Click += (_, _) => Close();
         _toolTip.SetToolTip(_btnClose, "Close (Esc)");
         _btnPlay = new ModernButton("Play", ButtonKind.Primary, Glyphs.Play) { Bounds = new Rectangle(480, 18, 96, 32) };
-        _btnPlay.Click += (_, _) => _playerLauncher.Launch(_targetFilePath);
+        _btnPlay.Click += (_, _) => _playerLauncher.Launch(_targetFilePath, owner: this);
         _toolTip.SetToolTip(_btnPlay, "Play the final recording");
         footer.Controls.AddRange([secondaryActions, _btnClose, _btnPlay]);
 

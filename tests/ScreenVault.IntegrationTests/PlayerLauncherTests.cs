@@ -20,41 +20,47 @@ public sealed class PlayerLauncherTests
     }
 
     [Fact]
-    public void ResolvePlayer_ForTsFile_NeverReturnsSystemDefault()
-    {
-        var settingsService = new FakeSettingsService();
-        settingsService.Current.Playback.Player = PlaybackPlayer.SystemDefault;
-
-        var launcher = new PlayerLauncher(settingsService);
-        var resolved = launcher.ResolvePlayer(@"C:\Recordings\test.ts");
-
-        // Never open .ts with system default (avoid opening IDEs like VS Code)
-        resolved.Type.ShouldNotBe(ResolvedPlayerType.SystemDefault);
-    }
-
-    [Fact]
-    public void ResolvePlayer_ForMkvFile_CanReturnSystemDefault()
-    {
-        var settingsService = new FakeSettingsService();
-        settingsService.Current.Playback.Player = PlaybackPlayer.SystemDefault;
-
-        var launcher = new PlayerLauncher(settingsService);
-        var resolved = launcher.ResolvePlayer(@"C:\Recordings\test.mkv");
-
-        resolved.Type.ShouldBe(ResolvedPlayerType.SystemDefault);
-    }
-
-    [Fact]
-    public void ResolvePlayer_Auto_ResolvesBundledFfplayOrVlc()
+    public void ResolvePlayer_Auto_NeverUsesABuiltInPlayer()
     {
         var settingsService = new FakeSettingsService();
         settingsService.Current.Playback.Player = PlaybackPlayer.Auto;
 
         var launcher = new PlayerLauncher(settingsService);
-        var resolved = launcher.ResolvePlayer(@"C:\Recordings\test.ts");
 
-        // Either VLC was detected on machine, or bundled ffplay was detected
-        resolved.Type.ShouldBeOneOf(ResolvedPlayerType.Vlc, ResolvedPlayerType.Ffplay);
-        resolved.ExecutablePath.ShouldNotBeNullOrWhiteSpace();
+        // The user's own video app, or Windows' "Open with" chooser — never a player of our own.
+        launcher.ResolvePlayer(@"C:\Recordings\test.mkv").Type.ShouldBe(ResolvedPlayerType.SystemDefault);
+        launcher.ResolvePlayer(@"C:\Recordings\test.ts").Type.ShouldBeOneOf(ResolvedPlayerType.SystemDefault, ResolvedPlayerType.AskUser);
+    }
+
+    [Fact]
+    public void ResolvePlayer_RetiredBuiltInPlayerSetting_UsesTheWindowsDefault()
+    {
+        var settingsService = new FakeSettingsService();
+        settingsService.Current.Playback.Player = PlaybackPlayer.Ffplay;
+
+        var launcher = new PlayerLauncher(settingsService);
+
+        launcher.ResolvePlayer(@"C:\Recordings\test.mp4").Type.ShouldBe(ResolvedPlayerType.SystemDefault);
+    }
+
+    [Fact]
+    public void ResolvePlayer_CustomPlayer_IsHonored()
+    {
+        var player = Path.GetTempFileName();
+        try
+        {
+            var settingsService = new FakeSettingsService();
+            settingsService.Current.Playback.Player = PlaybackPlayer.Custom;
+            settingsService.Current.Playback.CustomPlayerPath = player;
+
+            var resolved = new PlayerLauncher(settingsService).ResolvePlayer(@"C:\Recordings\test.mkv");
+
+            resolved.Type.ShouldBe(ResolvedPlayerType.Custom);
+            resolved.ExecutablePath.ShouldBe(player);
+        }
+        finally
+        {
+            File.Delete(player);
+        }
     }
 }
