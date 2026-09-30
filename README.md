@@ -16,12 +16,11 @@
 
 ## ⬇️ Download
 
-| Version | Release Type | Platform | Size | Checksum (SHA-256) |
-|---------|--------------|----------|------|--------------------|
-| [**ScreenVault_Setup_1.3.0.exe**](https://github.com/abhishek98as/ScreenVault-Smart-Screen-Recording-Tool-/releases/download/v1.3.0/ScreenVault_Setup_1.3.0.exe) | **Latest Stable (v1.3.0)** | Windows 10/11 x64 | ~147 MB | `582DACD9D83922F4F8E325784BF3AE756230AE4B39EB2CF3AD03D42E7010FA15` |
-| [**ScreenVault-Setup.exe** *(Latest Release Link)*](https://github.com/abhishek98as/ScreenVault-Smart-Screen-Recording-Tool-/releases/latest) | Rolling Latest | Windows 10/11 x64 | ~147 MB | *(Refer to release page)* |
+| Package | Version | Platform | Size | Direct Download | Verification |
+|---------|---------|----------|------|-----------------|--------------|
+| **ScreenVault Setup** | **v1.3.0** *(Latest)* | Windows 10/11 x64 | ~147 MB | [⬇️ **Download Installer (.exe)**](https://github.com/abhishek98as/ScreenVault-Smart-Screen-Recording-Tool-/raw/main/releases/ScreenVault_Setup_1.3.0.exe) | [`582DACD9...`](https://github.com/abhishek98as/ScreenVault-Smart-Screen-Recording-Tool-/blob/main/releases/ScreenVault_Setup_1.3.0.exe.sha256.txt) |
 
-> **No admin rights required.** Installs per-user or all-users, starts quietly at login, and bundles self-contained .NET 9 and FFmpeg.
+> 💡 **Quick Install**: Download and run `ScreenVault_Setup_1.3.0.exe`. No administrator privileges required. Automatically bundles self-contained .NET 9 and FFmpeg.
 
 </div>
 
