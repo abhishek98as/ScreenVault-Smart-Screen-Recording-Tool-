@@ -8,9 +8,11 @@ using ScreenVault.Core.Settings;
 using ScreenVault.Core.Storage;
 using Serilog;
 
+using ScreenVault.Core.SystemIntegration;
+
 namespace ScreenVault.Core.Recording;
 
-public sealed class RecordingController : IRecordingController, IAsyncDisposable
+public sealed class RecordingController : IRecordingController, IPausableRecorder, IAsyncDisposable
 {
     // FFmpeg that is running but has produced no output for this long after starting is stuck.
     private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(20);
@@ -60,11 +62,15 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
     private DateTime? _noAudioSinceUtc;
     private bool _noAudioToastShown;
 
+    private volatile PauseReason _pauseReason = PauseReason.User;
+
     public RecorderState State => _state;
     public DesiredState Desired => _desired;
     public HealthSnapshot Health => BuildHealthSnapshot();
     public SessionClock Clock => _sessionClock;
     public bool IsMicMuted => _audioEngine.IsMicMuted;
+    public bool IsRecording => _state == RecorderState.Recording;
+    public bool IsManuallyPaused => _desired == DesiredState.Paused && _pauseReason == PauseReason.User;
 
     public event EventHandler<HealthSnapshot>? HealthChanged;
     public event EventHandler? PauseReminderTriggered;
@@ -151,7 +157,7 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
         }
     }
 
-    public async Task PauseAsync(CancellationToken ct = default)
+    public async Task PauseAsync(PauseReason reason, CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -162,7 +168,8 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
                 return;
             }
 
-            Log.Information("Pause requested by user.");
+            Log.Information("Pause requested. Reason={Reason}", reason);
+            _pauseReason = reason;
             _desired = DesiredState.Paused;
             await ReconcileLockedAsync().ConfigureAwait(false);
         }
@@ -171,6 +178,9 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
             _lock.Release();
         }
     }
+
+    // Legacy overload for callers that don't pass a reason (e.g. old SystemEventsMonitor path)
+    public Task PauseAsync(CancellationToken ct = default) => PauseAsync(PauseReason.User, ct);
 
     public async Task ResumeAsync(CancellationToken ct = default)
     {
@@ -594,6 +604,7 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
         var current = _settingsService.Current.Video.FrameRate;
         var newFps = current switch
         {
+            > 30 => 30,
             > 24 => 24,
             > 15 => 15,
             > 10 => 10,
@@ -1181,7 +1192,8 @@ public sealed class RecordingController : IRecordingController, IAsyncDisposable
             _ffmpegHost.LastProgress.Speed,
             partElapsed,
             current?.Index ?? _currentPartIndex,
-            _ffmpegHost.WorkingSet64);
+            _ffmpegHost.WorkingSet64,
+            _desired == DesiredState.Paused && _pauseReason != PauseReason.User ? _pauseReason : null);
     }
 
     public async ValueTask DisposeAsync()

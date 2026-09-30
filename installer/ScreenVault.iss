@@ -43,20 +43,17 @@ ArchitecturesInstallIn64BitMode=x64compatible
 SetupArchitecture=x64
 #endif
 MinVersion=10.0.17763
-; Look & feel: Windows 11 style, follows light/dark mode, no divider lines, branded artwork.
-WizardStyle=modern dynamic windows11 hidebevels
+; Look & feel: modern wizard, branded artwork.
+WizardStyle=modern
 WizardSizePercent=120
 WizardBackColor=#F7F7FB
-WizardBackColorDynamicDark=#18191D
 WizardImageFile={#WizardImages}
-WizardImageFileDynamicDark={#WizardImagesDark}
 WizardSmallImageFile={#WizardSmallImages}
-WizardSmallImageFileDynamicDark={#WizardSmallImages}
 SetupIconFile=assets\ScreenVault.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 LicenseFile=assets\LICENSE.txt
-OutputDir=..\artifacts\installer
+OutputDir=..\dist
 OutputBaseFilename=ScreenVault_Setup_{#AppVersion}
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -80,7 +77,7 @@ Name: "startwithwindows"; Description: "Start ScreenVault when I sign in (runs q
 Name: "startrecording"; Description: "Start recording automatically when ScreenVault starts"; GroupDescription: "When Windows starts:"; Flags: unchecked
 
 [Files]
-Source: "..\artifacts\publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\publish\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Always-on screen and meeting recorder"
@@ -665,10 +662,7 @@ begin
     RegDeleteValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#AppName}');
 
     { Offer to delete settings and logs (never recordings) }
-    if TaskDialogMsgBox('Also delete your settings and logs?',
-      'Your recordings are not affected either way.',
-      mbConfirmation, MB_YESNO or MB_DEFBUTTON2,
-      ['Delete settings and logs', 'Keep them'], 0) = IDYES then
+    if MsgBox('Also delete your ScreenVault settings and logs? (Your recordings are NOT affected)', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
     begin
       DelTree(ExpandConstant('{userappdata}\ScreenVault'), True, True, True);
       DelTree(ExpandConstant('{localappdata}\ScreenVault'), True, True, True);

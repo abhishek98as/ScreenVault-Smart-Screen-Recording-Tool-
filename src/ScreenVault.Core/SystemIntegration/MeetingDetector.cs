@@ -38,6 +38,9 @@ public sealed class MeetingDetector : IMeetingDetector
     public event EventHandler<MeetingDetectedEventArgs>? MeetingStarted;
     public event EventHandler<MeetingDetectedEventArgs>? MeetingEnded;
 
+    /// <summary>True while at least one meeting app is actively using the microphone.</summary>
+    public bool IsMeetingActive => _activeAppsFirstSeen.Count > 0;
+
     public MeetingDetector(ISettingsService settingsService)
     {
         _settingsService = settingsService ?? throw new ArgumentNullException(nameof(settingsService));

@@ -22,6 +22,15 @@ public enum DesiredState
     Paused
 }
 
+/// <summary>Why a recording was paused. User = manually paused by the user. All others are automatic.</summary>
+public enum PauseReason
+{
+    User,
+    Away,
+    Locked,
+    Asleep
+}
+
 public sealed record HealthSnapshot(
     RecorderState State,
     DesiredState Desired,
@@ -36,4 +45,5 @@ public sealed record HealthSnapshot(
     double Speed,
     TimeSpan PartElapsed = default,
     int PartIndex = 1,
-    long FfmpegWorkingSetBytes = 0);
+    long FfmpegWorkingSetBytes = 0,
+    PauseReason? AutoPauseReason = null);

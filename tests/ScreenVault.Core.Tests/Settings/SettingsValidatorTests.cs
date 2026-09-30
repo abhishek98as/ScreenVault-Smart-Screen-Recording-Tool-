@@ -44,10 +44,21 @@ public sealed class SettingsValidatorTests
     }
 
     [Fact]
+    public void Validate_SplitMinutesZero_IsValid()
+    {
+        var settings = AppSettings.CreateDefault();
+        settings.Storage.SplitMinutes = 0; // 0 = don't split by time
+
+        var result = SettingsValidator.Validate(settings);
+
+        result.IsValid.ShouldBeTrue();
+    }
+
+    [Fact]
     public void Validate_InvalidSplitMinutes_ReturnsError()
     {
         var settings = AppSettings.CreateDefault();
-        settings.Storage.SplitMinutes = 0;
+        settings.Storage.SplitMinutes = -1;
 
         var result = SettingsValidator.Validate(settings);
 

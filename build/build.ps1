@@ -78,10 +78,8 @@ if (-not $SkipTests) {
     Write-Host "`n--> [1/5] Skipping tests as requested." -ForegroundColor Yellow
 }
 
-# 4. Clean Artifacts
-$artifactsDir = Join-Path $repoRoot "artifacts"
-$publishDir = Join-Path $artifactsDir "publish"
-$installerOutDir = Join-Path $artifactsDir "installer"
+$publishDir = Join-Path $repoRoot "publish"
+$installerOutDir = Join-Path $repoRoot "dist"
 
 Write-Host "`n--> [2/5] Preparing output directories..." -ForegroundColor Cyan
 if (Test-Path $publishDir) {

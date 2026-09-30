@@ -86,6 +86,10 @@ public sealed class NotificationSettings
 {
     public bool DeviceSwitch { get; set; } = true;
     public bool Storage { get; set; } = true;
+    public bool AutoPauseResume { get; set; } = true;
+    public bool RecordingSaved { get; set; } = true;
+    public bool Markers { get; set; } = true;
+    public bool PerformanceWarnings { get; set; } = true;
 }
 
 public sealed class VideoSettings
@@ -98,6 +102,7 @@ public sealed class VideoSettings
     public string? EncoderFingerprint { get; set; }
     public bool CaptureCursor { get; set; } = true;
     public bool DownscaleTo1080p { get; set; }
+    public bool HideAppFromCapture { get; set; } = true;
 }
 
 public sealed class AudioSettings
@@ -201,6 +206,18 @@ public sealed class AdvancedSettings
     public int SpeedDegradeSeconds { get; set; } = 20;
 }
 
+public sealed class AutoPauseSettings
+{
+    public bool PauseWhenAway { get; set; } = true;
+    public int AwayMinutes { get; set; } = 10;
+    public bool KeepRecordingDuringCalls { get; set; } = true;
+    public bool KeepRecordingWhileSoundPlays { get; set; } = true;
+    public bool ResumeWhenBack { get; set; } = true;
+    public bool PauseWhenLocked { get; set; } = true;
+    public bool PauseOnSleep { get; set; } = true;
+    public int PausedReminderMinutes { get; set; } = 10;
+}
+
 public sealed class AppSettings
 {
     public int SchemaVersion { get; set; } = 2;
@@ -216,6 +233,7 @@ public sealed class AppSettings
     public HotkeySettings Hotkeys { get; set; } = new();
     public TranscriptionSettings Transcription { get; set; } = new();
     public AdvancedSettings Advanced { get; set; } = new();
+    public AutoPauseSettings AutoPause { get; set; } = new();
 
     public static AppSettings CreateDefault()
     {

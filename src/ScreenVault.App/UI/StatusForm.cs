@@ -624,7 +624,14 @@ public sealed class StatusForm : ModernForm
                 break;
 
             case RecorderState.Paused:
-                SetPill("Paused", Tone.Warning);
+                var pauseLabel = health.AutoPauseReason switch
+                {
+                    PauseReason.Away => "Paused · You're away",
+                    PauseReason.Locked => "Paused · Screen locked",
+                    PauseReason.Asleep => "Paused · PC asleep",
+                    _ => "Paused"
+                };
+                SetPill(pauseLabel, Tone.Warning);
                 SetMainButton("Stop & save", ButtonKind.Strong, Glyphs.Stop, enabled: true);
                 SetPauseButton(paused: true, enabled: true);
                 _btnTestAudio.Enabled = false;

@@ -36,6 +36,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly RecoveryService _recoveryService;
     private readonly RetentionService _retentionService;
     private readonly SystemEventsMonitor _systemEventsMonitor;
+    private readonly AutoPauseService _autoPauseService;
     private readonly ControlPipeServer _pipeServer;
     private readonly HotkeyService _hotkeyService;
     private readonly NotificationPresenter _notificationPresenter;
@@ -43,6 +44,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ClipExporter _clipExporter;
     private readonly MeetingDetector _meetingDetector;
     private readonly ReminderService _reminderService;
+    private readonly DisplayStateWatcher _displayStateWatcher;
 
     private readonly NotifyIcon _notifyIcon;
     private readonly StatusForm _statusForm;
@@ -102,11 +104,14 @@ public sealed class TrayApplicationContext : ApplicationContext
         _audioEngine = new AudioEngine();
         _audioEngine.Start(_settingsService.Current.Audio);
 
+        CaptureExclusion.ApplyToOpenForms(_settingsService.Current.Video.HideAppFromCapture);
+
         // Audio and storage settings apply immediately (new folders are used from the next part on).
         _settingsService.SettingsChanged += (_, s) =>
         {
             _audioEngine.ApplySettings(s.Audio);
             _storageManager.UpdateSettings(s.Storage);
+            CaptureExclusion.ApplyToOpenForms(s.Video.HideAppFromCapture);
         };
 
         _controller = new RecordingController(
@@ -136,6 +141,12 @@ public sealed class TrayApplicationContext : ApplicationContext
         _clipExporter = new ClipExporter(_sessionStore);
         _meetingDetector = new MeetingDetector(_settingsService);
         _reminderService = new ReminderService(_settingsService, _controller);
+        _autoPauseService = new AutoPauseService(_controller, _settingsService, _meetingDetector);
+        _systemEventsMonitor.SetAutoPauseService(_autoPauseService);
+
+        _displayStateWatcher = new DisplayStateWatcher();
+        _displayStateWatcher.DisplayTurnedOff += () => _autoPauseService.OnDisplayOff();
+        _displayStateWatcher.DisplayTurnedOn += () => _autoPauseService.OnDisplayOn();
 
         // 2. Tray & UI Setup
         _notifyIcon = new NotifyIcon
@@ -198,6 +209,25 @@ public sealed class TrayApplicationContext : ApplicationContext
             }
         };
         _controller.SessionCompleted += (_, manifest) => OnSessionCompleted(manifest);
+
+        // AutoPause notifications
+        _autoPauseService.AutoPaused += (_, reason) => RunOnUi(() =>
+        {
+            if (!_settingsService.Current.General.Notifications.AutoPauseResume) return;
+            var label = reason switch
+            {
+                ScreenVault.Core.Recording.PauseReason.Away => "No activity for a while",
+                ScreenVault.Core.Recording.PauseReason.Locked => "Screen locked",
+                ScreenVault.Core.Recording.PauseReason.Asleep => "PC went to sleep",
+                _ => "Paused automatically"
+            };
+            _notificationPresenter.ShowInfo("Recording paused", label);
+        });
+        _autoPauseService.AutoResumed += (_, _) => RunOnUi(() =>
+        {
+            if (_settingsService.Current.General.Notifications.AutoPauseResume)
+                _notificationPresenter.ShowInfo("Recording resumed", "You're back");
+        });
 
         // 5. Meeting Detection
         _meetingDetector.MeetingStarted += (_, e) => OnMeetingStarted(e);
@@ -665,7 +695,13 @@ public sealed class TrayApplicationContext : ApplicationContext
         var stateStr = health.State switch
         {
             RecorderState.Recording => "● REC",
-            RecorderState.Paused => "❚❚ PAUSED",
+            RecorderState.Paused => health.AutoPauseReason switch
+            {
+                PauseReason.Away => "❚❚ AWAY",
+                PauseReason.Locked => "❚❚ LOCKED",
+                PauseReason.Asleep => "❚❚ ASLEEP",
+                _ => "❚❚ PAUSED"
+            },
             RecorderState.Faulted => "! RETRYING",
             RecorderState.Starting or RecorderState.Recovering => "… STARTING",
             RecorderState.Saving or RecorderState.Stopping => "… SAVING",
@@ -757,14 +793,46 @@ public sealed class TrayApplicationContext : ApplicationContext
         WindowActivator.BringToFront(_statusForm);
     }
 
-    private void ShowSettingsDialog()
-    {
-        if (_settingsForm == null || _settingsForm.IsDisposed)
-        {
-            _settingsForm = new SettingsForm(_settingsService, _audioEngine);
-        }
+    private void ShowSettingsDialog() => ShowSettingsDialog((string?)null);
 
-        OpenMainWindow(_settingsForm);
+    private void ShowSettingsDialog(string? page)
+    {
+        try
+        {
+            if (_settingsForm == null || _settingsForm.IsDisposed)
+            {
+                _settingsForm = new SettingsForm(_settingsService, _audioEngine);
+            }
+
+            if (page != null && _settingsForm is SettingsForm sf)
+                sf.SelectPage(page);
+
+            OpenMainWindow(_settingsForm);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Failed to open Settings dialog.");
+            try { _settingsForm?.Dispose(); } catch { }
+            _settingsForm = null;
+
+            var logsFolder = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "ScreenVault", "logs");
+            try
+            {
+                UI.ModernDialog.Error(null,
+                    "Settings couldn't open",
+                    $"{ex.Message}\n\nDetails are in:\n{logsFolder}");
+            }
+            catch
+            {
+                MessageBox.Show(
+                    $"Settings couldn't open: {ex.Message}\n\nSee logs in {logsFolder}",
+                    "ScreenVault",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
     }
 
     /// <summary>
@@ -948,6 +1016,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 await _controller.DisposeAsync().ConfigureAwait(false);
                 await _pipeServer.DisposeAsync().ConfigureAwait(false);
                 _meetingDetector.Dispose();
+                _autoPauseService.Dispose();
                 _reminderService.Dispose();
                 _midnightTimer.Dispose();
                 _postProcessor.Dispose();
@@ -965,6 +1034,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 // Windows and hotkeys belong to the UI thread: finish the shutdown there.
                 RunOnUi(() =>
                 {
+                    _displayStateWatcher.Dispose();
                     _hotkeyService.Dispose();
                     ExitThread();
                 });

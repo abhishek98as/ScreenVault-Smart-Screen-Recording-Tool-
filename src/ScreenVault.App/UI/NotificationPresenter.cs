@@ -141,6 +141,7 @@ public sealed class NotificationPresenter : INotificationPresenter
 
     public void ShowMarkerAdded(DateTime timeLocal)
     {
+        if (!_settingsService.Current.General.Notifications.Markers) return;
         ShowRateLimited("MarkerAdded", TimeSpan.FromSeconds(5),
             "Marker Added",
             $"Marker added at {timeLocal:HH:mm:ss}.",
@@ -157,6 +158,7 @@ public sealed class NotificationPresenter : INotificationPresenter
 
     public void ShowFpsDegraded(int fps)
     {
+        if (!_settingsService.Current.General.Notifications.PerformanceWarnings) return;
         ShowRateLimited("FpsDegraded", TimeSpan.FromMinutes(2),
             "Encoding Performance Warning",
             $"Encoder couldn't keep up. Lowered frame rate to {fps} fps to prevent dropping frames.",
@@ -173,6 +175,7 @@ public sealed class NotificationPresenter : INotificationPresenter
 
     public void ShowNoAudioSources()
     {
+        if (!_settingsService.Current.General.Notifications.PerformanceWarnings) return;
         ShowRateLimited("NoAudioSources", TimeSpan.FromSeconds(60),
             "Audio Source Missing",
             "Recording has no audio source — check your devices",
@@ -181,6 +184,7 @@ public sealed class NotificationPresenter : INotificationPresenter
 
     public void ShowSaved(string sessionId, string filePath)
     {
+        if (!_settingsService.Current.General.Notifications.RecordingSaved) return;
         var fileName = !string.IsNullOrEmpty(filePath) ? System.IO.Path.GetFileName(filePath) : sessionId;
         ShowRateLimited("Saved_" + sessionId, TimeSpan.FromSeconds(5),
             "Recording Saved",

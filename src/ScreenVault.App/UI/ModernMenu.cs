@@ -1,3 +1,4 @@
+using ScreenVault.App.Platform;
 using ScreenVault.App.UI.Theming;
 
 namespace ScreenVault.App.UI;
@@ -29,7 +30,14 @@ public static class ModernMenu
         menu.ShowImageMargin = true;
         menu.Padding = new Padding(4, 6, 4, 6);
         menu.ImageScalingSize = new Size(16, 16);
-        menu.HandleCreated += (_, _) => NativeTheme.ApplyWindowFrame(menu.Handle, Theme.Current, WindowCorners.RoundSmall);
+        menu.HandleCreated += (_, _) =>
+        {
+            NativeTheme.ApplyWindowFrame(menu.Handle, Theme.Current, WindowCorners.RoundSmall);
+            if (CaptureExclusion.ExcludeFromCapture)
+            {
+                CaptureExclusion.Exclude(menu.Handle);
+            }
+        };
         menu.Opening += (_, _) =>
         {
             Theme.Refresh();
@@ -38,6 +46,10 @@ public static class ModernMenu
             if (menu.IsHandleCreated)
             {
                 NativeTheme.ApplyWindowFrame(menu.Handle, Theme.Current, WindowCorners.RoundSmall);
+                if (CaptureExclusion.ExcludeFromCapture)
+                {
+                    CaptureExclusion.Exclude(menu.Handle);
+                }
             }
         };
     }

@@ -16,11 +16,12 @@
 
 ## ⬇️ Download
 
-| Version | Platform | Size |
-|---------|----------|------|
-| [**ScreenVault-Setup.exe** *(Latest Release)*](https://github.com/abhishek98as/ScreenVault-Smart-Screen-Recording-Tool-/releases/latest) | Windows 10/11 x64 | ~50 MB |
+| Version | Release Type | Platform | Size | Checksum (SHA-256) |
+|---------|--------------|----------|------|--------------------|
+| [**ScreenVault_Setup_1.3.0.exe**](https://github.com/abhishek98as/ScreenVault-Smart-Screen-Recording-Tool-/releases/download/v1.3.0/ScreenVault_Setup_1.3.0.exe) | **Latest Stable (v1.3.0)** | Windows 10/11 x64 | ~147 MB | `582DACD9D83922F4F8E325784BF3AE756230AE4B39EB2CF3AD03D42E7010FA15` |
+| [**ScreenVault-Setup.exe** *(Latest Release Link)*](https://github.com/abhishek98as/ScreenVault-Smart-Screen-Recording-Tool-/releases/latest) | Rolling Latest | Windows 10/11 x64 | ~147 MB | *(Refer to release page)* |
 
-> **No admin rights required.** Installs per-user, starts automatically at login.
+> **No admin rights required.** Installs per-user or all-users, starts quietly at login, and bundles self-contained .NET 9 and FFmpeg.
 
 </div>
 
@@ -39,12 +40,24 @@ It was built for developers, remote workers, and anyone who needs a reliable, al
 ### 🛡️ Crash-Proof Recording Pipeline
 Video and audio are written as continuous **MPEG-TS streams** with **1-second durable disk flushes**. If the app crashes, GPU driver resets, or power fails — at most ~1 second of video is lost. Period.
 
+### ⏸️ Intelligent Auto-Pause & Resume
+Never record hours of empty desktop or lock screens. ScreenVault intelligently monitors your activity:
+- **Inactivity Detection**: Pauses automatically after configurable idle minutes (1–120 min).
+- **Lock, Sleep & Display Off**: Pauses instantly on Win+L, sleep/suspend, or display sleep via `GUID_CONSOLE_DISPLAY_STATE`.
+- **Seamless Auto-Resume**: Instantly resumes when you sign back in or wake up your display.
+- **Smart Call Exemption**: Automatically prevents auto-pause if you are in an active meeting (Teams, Zoom, Google Meet, Slack, Discord) or playing system sound.
+- **Auto-Pause Markers**: Drops automatic markers with pause reasons directly into your session logs and chapters.
+
+### 👻 Hide App from Capture (Ghost Window Mode)
+Using Windows **`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`**, ScreenVault's Settings dialog, live status HUD, and context menus are rendered completely invisible to the screen capture pipeline. No more recorder settings appearing in your final videos.
+
 ### ⚡ GPU-Accelerated Screen Capture
 Zero-copy desktop capture via Windows **Desktop Duplication API** (`ddagrab`) with hardware encoding support:
 - **NVIDIA** → NVENC
 - **Intel** → Quick Sync (QSV)
 - **AMD** → AMF
 - **Fallback** → Software x264
+- **Configurable Frame Rates**: 5, 10, 15, 24, 30, or 60 fps to match any use case from high-motion gaming to ultra-efficient all-day documentation.
 
 ### 🎙️ Dual-Device Audio Mixing
 Mixes microphone (`WASAPI client`) and system audio (`WASAPI loopback`) in a single **48 kHz / 32-bit float pipeline** with soft limiting — preventing drift or desync across multi-hour sessions.
@@ -52,8 +65,8 @@ Mixes microphone (`WASAPI client`) and system audio (`WASAPI loopback`) in a sin
 ### 🔄 Seamless Device Failover
 Unplug a Bluetooth headset, answer a Teams call, or switch your default audio endpoint — ScreenVault dynamically reconciles within **0.5 seconds** without interrupting the recording.
 
-### ✂️ Keyframe-Aligned File Splitting
-Video is automatically split every **10 minutes at IDR keyframes**. Every segment can be played independently in any media player. No corrupted files at boundaries.
+### ✂️ Keyframe-Aligned File Splitting & Continuous Recording
+Video is automatically split every **10 minutes at IDR keyframes** (configurable from 1 to 180 minutes, or set to 0 for single continuous recordings). Every segment can be played independently in any media player.
 
 ### 🗜️ Lossless Background Remuxing
 Completed `.ts` segments are silently remuxed to `.mkv` (or `.mp4`) in the background with **zero quality loss**, verified with `ffprobe` before the source stream is discarded.
@@ -63,6 +76,9 @@ Continuously monitors disk space. Automatically fails over to a secondary or bac
 
 ### 📍 Instant Markers & Chapters
 Press `Ctrl+Alt+Shift+M` to drop a timestamped note mid-meeting. Notes are saved to `markers.txt` and **automatically embedded as chapters** in your MKV files.
+
+### ⚙️ Modular Settings Hub
+Completely isolated, modular settings pages for **General**, **Pause & resume**, **Meetings**, **Video**, **Audio**, **Recordings**, **Notifications**, **Shortcuts**, **Advanced**, and **About**, featuring per-page error boundaries and instant live validation.
 
 ### 🔒 100% Offline — Zero Telemetry
 ScreenVault makes **no network requests**, collects no data, and operates entirely offline. Your recordings stay yours.
@@ -261,6 +277,31 @@ Ensure Windows microphone access is enabled:
 
 ### High CPU Usage
 If software encoding is being used (no compatible GPU), CPU usage will be higher. Install the latest GPU drivers to enable hardware encoding (NVENC/QSV/AMF).
+
+---
+
+## 📈 Enterprise Feature Journey & Release History
+
+ScreenVault follows an enterprise-grade release cycle with continuous verification, zero-crash fault isolation, and deterministic backward compatibility.
+
+### 🌟 Version 1.3.0 (Current Release)
+- **Auto-Pause Engine**: Added user inactivity sensing, lock screen detection, sleep/suspend hooks, and display-off monitoring with automatic resume.
+- **Meeting & Sound Exemption**: Smart bypass keeps recording during active video/audio conferences (Teams, Zoom, Meet, Slack, Discord).
+- **Ghost Capture Exclusion**: `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` applied to all forms and menus, keeping internal app UI out of captures.
+- **Modular Settings Architecture**: Refactored Settings into 10 decoupled partial pages with lazy rendering, isolated error fallbacks, and real-time live application.
+- **Advanced FPS & Split Control**: Added support for 5, 10, 15, 24, 30, and 60 fps; added support for disabling time splits (split = 0).
+- **Hardened UI Smoke Tests & CI**: Automated headless UI smoke testing under light and dark themes; GitHub Actions CI workflow for Windows.
+
+### 🌟 Version 1.2.0
+- **Audio Engine Hardening**: 48 kHz / 32-bit float audio mixing with WASAPI loopback and microphone inputs.
+- **Seamless Failover**: 0.5s audio endpoint reconnection without interrupting video pipelines.
+- **Background Remuxer**: Automated MKV/MP4 remuxing with integrity verification.
+- **Theme Engine**: System-following fluent light/dark modes with accessible typography and high-contrast support.
+
+### 🌟 Version 1.1.0
+- **MPEG-TS Resilient Recording**: 1-second durable disk flush stream writer preventing file corruption upon crash or power failure.
+- **Crash Recovery & Restart Manager**: Seamless process recovery using Windows Restart Manager APIs.
+- **Global Hotkeys & CLI IPC**: Single-instance named-pipe architecture with global shortcut hooks.
 
 ---
 

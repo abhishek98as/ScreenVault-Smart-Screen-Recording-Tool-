@@ -7,11 +7,8 @@ namespace ScreenVault.Core.SystemIntegration;
 public sealed class SystemEventsMonitor : IDisposable
 {
     private readonly RecordingController _controller;
+    private AutoPauseService? _autoPauseService;
     private bool _isDisposed;
-
-    // Set when a system suspend paused a recording, so waking up resumes only that recording
-    // (never starts one the user didn't have running, never undoes a manual pause).
-    private volatile bool _pausedForSuspend;
 
     public SystemEventsMonitor(RecordingController controller)
     {
@@ -31,59 +28,64 @@ public sealed class SystemEventsMonitor : IDisposable
         }
     }
 
+    /// <summary>Wire up the AutoPauseService so it receives power and session events.</summary>
+    public void SetAutoPauseService(AutoPauseService service)
+    {
+        _autoPauseService = service;
+    }
+
     private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
     {
         Log.Information("Windows PowerModeChanged: {Mode}", e.Mode);
         if (e.Mode == PowerModes.Suspend)
         {
-            if (_controller.Desired != DesiredState.Recording)
-            {
-                return;
-            }
+            _autoPauseService?.OnSuspend();
 
-            // Suspend PC
-            _pausedForSuspend = true;
-            Task.Run(async () =>
+            // Legacy path: keep existing suspend-pause when AutoPause is disabled
+            if (_autoPauseService == null && _controller.Desired == DesiredState.Recording)
             {
-                try
+                Task.Run(async () =>
                 {
-                    await _controller.PauseAsync().ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, "Error pausing recording during system suspend.");
-                }
-            });
+                    try { await _controller.PauseAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { Log.Error(ex, "Error pausing on system suspend."); }
+                });
+            }
         }
         else if (e.Mode == PowerModes.Resume)
         {
-            if (!_pausedForSuspend)
+            _autoPauseService?.OnResume();
+
+            if (_autoPauseService == null)
             {
-                return;
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(3000).ConfigureAwait(false);
+                        await _controller.ResumeAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception ex) { Log.Error(ex, "Error resuming after system resume."); }
+                });
             }
-
-            _pausedForSuspend = false;
-
-            // Resume PC: wait 3 seconds for audio stack and monitors to re-enumerate
-            Task.Run(async () =>
-            {
-                try
-                {
-                    Log.Information("Waiting 3 seconds after system resume for hardware stabilization...");
-                    await Task.Delay(3000).ConfigureAwait(false);
-                    await _controller.ResumeAsync().ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, "Error resuming recording after system resume.");
-                }
-            });
         }
     }
 
     private void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
     {
         Log.Information("Windows SessionSwitch: {Reason}", e.Reason);
+
+        // Notify AutoPauseService for lock/unlock
+        switch (e.Reason)
+        {
+            case SessionSwitchReason.SessionLock:
+                _autoPauseService?.OnSessionLocked();
+                break;
+            case SessionSwitchReason.SessionUnlock:
+                _autoPauseService?.OnSessionUnlocked();
+                break;
+        }
+
+        // Always add the session marker
         if (_controller.State is RecorderState.Recording or RecorderState.Paused)
         {
             var label = e.Reason switch

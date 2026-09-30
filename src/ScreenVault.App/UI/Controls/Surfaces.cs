@@ -418,8 +418,6 @@ public sealed class SettingRow : Panel, IThemeAware
     {
         SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.ResizeRedraw | ControlStyles.UserPaint, true);
         _glyph = glyph;
-        Padding = new Padding(16, 12, 16, 12);
-        Height = 56;
 
         _title = new TextLabel(title, Typography.Body) { AutoSize = false };
         _hasDescription = !string.IsNullOrEmpty(description);
@@ -434,6 +432,8 @@ public sealed class SettingRow : Panel, IThemeAware
             control.SizeChanged += (_, _) => PerformLayout();
         }
 
+        Padding = new Padding(16, 12, 16, 12);
+        Height = 56;
         AccessibleName = title;
     }
 
@@ -483,6 +483,8 @@ public sealed class SettingRow : Panel, IThemeAware
     protected override void OnLayout(LayoutEventArgs levent)
     {
         base.OnLayout(levent);
+        if (_title == null || _description == null)
+            return;
         var layout = Measure(Width);
         _title.SetBounds(layout.TextLeft, layout.TitleTop, layout.TextWidth, layout.TitleHeight);
         _description.SetBounds(layout.TextLeft, layout.TitleTop + layout.TitleHeight + layout.Gap, layout.TextWidth, layout.DescriptionHeight);

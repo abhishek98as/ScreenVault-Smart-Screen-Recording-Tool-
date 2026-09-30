@@ -34,9 +34,10 @@ public static class SettingsValidator
             errors.Add("System gain must be between -30 dB and +30 dB.");
         }
 
-        if (settings.Storage.SplitMinutes is < 1 or > 1440)
+        // 0 = don't split by time; otherwise 1-1440 minutes.
+        if (settings.Storage.SplitMinutes != 0 && settings.Storage.SplitMinutes is < 1 or > 1440)
         {
-            errors.Add("File split duration must be between 1 and 1440 minutes.");
+            errors.Add("File split duration must be 0 (no split) or between 1 and 1440 minutes.");
         }
 
         var enabledLocations = settings.Storage.Locations.Where(l => l.Enabled).ToList();
@@ -75,6 +76,47 @@ public static class SettingsValidator
             }
         }
 
+        // AutoPause validation
+        if (settings.AutoPause.AwayMinutes is < 1 or > 240)
+        {
+            errors.Add("Away timeout must be between 1 and 240 minutes.");
+        }
+
+        if (settings.AutoPause.PausedReminderMinutes < 0 || settings.AutoPause.PausedReminderMinutes > 60)
+        {
+            errors.Add("Paused reminder interval must be between 0 (off) and 60 minutes.");
+        }
+
+        // Advanced watchdog
+        if (settings.Advanced.FfmpegMemoryRestartMb <= settings.Advanced.FfmpegMemoryWarnMb)
+        {
+            errors.Add("FFmpeg memory restart threshold must be above the warning threshold.");
+        }
+
+        // Playback: custom player path must exist when Custom is chosen
+        if (settings.Playback.Player == PlaybackPlayer.Custom &&
+            (string.IsNullOrWhiteSpace(settings.Playback.CustomPlayerPath) ||
+             !File.Exists(settings.Playback.CustomPlayerPath)))
+        {
+            errors.Add("Custom player path must point to an existing executable.");
+        }
+
+        // Work reminder time validation
+        if (!TryParseTime(settings.Reminders.WorkStart, out _))
+            errors.Add($"Work start time '{settings.Reminders.WorkStart}' is not a valid HH:mm value.");
+
+        if (!TryParseTime(settings.Reminders.WorkEnd, out _))
+            errors.Add($"Work end time '{settings.Reminders.WorkEnd}' is not a valid HH:mm value.");
+
         return new ValidationResult(errors.Count == 0, errors, warnings);
+    }
+
+    private static bool TryParseTime(string? value, out TimeSpan result)
+    {
+        result = default;
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        if (TimeSpan.TryParseExact(value, "hh\\:mm", null, out result)) return true;
+        if (TimeSpan.TryParseExact(value, "h\\:mm", null, out result)) return true;
+        return false;
     }
 }

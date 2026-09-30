@@ -119,6 +119,10 @@ public class ModernForm : Form, IThemeAware
     {
         base.OnHandleCreated(e);
         ApplyFrame();
+        if (CaptureExclusion.ExcludeFromCapture)
+        {
+            CaptureExclusion.Exclude(Handle);
+        }
     }
 
     protected override void OnVisibleChanged(EventArgs e)
